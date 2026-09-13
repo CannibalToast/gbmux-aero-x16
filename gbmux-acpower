@@ -42,9 +42,25 @@ fi
 
 # --- on battery: try to eject the dGPU ---
 
+# Optional: /etc/gbmux-acpower.conf -> KILL_ON_BATTERY="rustdesk obs"
+# Named processes holding the GPU get killed so they can restart and fall
+# back to iGPU/software paths. Opt-in: killing apps loses their GPU work.
+KILL_ON_BATTERY=""
+[ -f /etc/gbmux-acpower.conf ] && . /etc/gbmux-acpower.conf
+
 # Compute/control fds (CUDA, NVENC, nvidia-smi loops) pin the driver's
 # remove path; kwin's /dev/dri/card* fds do not. Eject only if none held.
 pids=$(fuser /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null)
+if [ -n "$pids" ] && [ -n "$KILL_ON_BATTERY" ]; then
+    for p in $pids; do
+        comm=$(ps -o comm= -p "$p" 2>/dev/null)
+        case " $KILL_ON_BATTERY " in
+            *" $comm "*) kill "$p" 2>/dev/null && log "killed $comm ($p) holding dGPU";;
+        esac
+    done
+    sleep 2
+    pids=$(fuser /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null)
+fi
 if [ -n "$pids" ]; then
     log "on battery: GPU held by $(ps -o comm= -p $pids 2>/dev/null | sort -u | tr '\n' ' ')— not ejecting (RTD3 may still suspend it)"
     exit 0

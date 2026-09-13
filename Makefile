@@ -9,6 +9,7 @@ install:
 	install -Dm644 99-gbmux-acpower.rules $(DESTDIR)/etc/udev/rules.d/99-gbmux-acpower.rules
 	install -Dm644 gbmux-acpower.service $(DESTDIR)/lib/systemd/system/gbmux-acpower.service
 	install -Dm644 gbmux-nouveau.conf $(DESTDIR)/etc/modprobe.d/gbmux-nouveau.conf
+	install -Dm644 gbmux-acpower.conf $(DESTDIR)/etc/gbmux-acpower.conf
 	install -Dm644 README.md $(DESTDIR)$(PREFIX)/share/doc/gbmux/README.md
 ifndef DESTDIR
 	udevadm control --reload || true

@@ -56,6 +56,20 @@ No custom kernel module — just `acpi_call` and sysfs.
 Logs: `journalctl -t gbmux-acpower`. Disable:
 `sudo systemctl disable --now gbmux-acpower.service`.
 
+### Apps holding the GPU
+
+GPU contexts can't migrate — a process holding `/dev/nvidia*` (CUDA, NVENC)
+blocks eject, and there is no transparent fallback to another vendor's GPU.
+The approximation: kill the app so it restarts without the dGPU and falls
+back itself (e.g. rustdesk NVENC → x264). Opt-in via
+`/etc/gbmux-acpower.conf`:
+
+```
+KILL_ON_BATTERY="rustdesk"
+```
+
+Empty (default) = never kill; eject is skipped while the GPU is in use.
+
 ## No runtime (no-reboot) mux switching
 
 Verified exhaustively — this board's mux is POST-only hardware:
