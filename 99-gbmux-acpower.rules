@@ -1,0 +1,4 @@
+# AERO X16: apply dGPU power policy on AC adapter changes.
+# Spawns a systemd oneshot instead of blocking udev.
+ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}="gbmux-acpower.service"

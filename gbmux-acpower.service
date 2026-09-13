@@ -1,0 +1,10 @@
+[Unit]
+Description=gbmux AC/battery dGPU power policy (AERO X16)
+# Runs at boot and on every AC online/offline udev event; idempotent.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/gbmux/gbmux-acpower
+
+[Install]
+WantedBy=multi-user.target

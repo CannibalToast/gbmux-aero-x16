@@ -1,0 +1,42 @@
+#!/bin/sh
+# gbmux-acpower — dGPU power follows AC state on the Gigabyte AERO X16.
+#
+# Triggered by udev (99-gbmux-acpower.rules) on AC adapter changes and once
+# at boot via gbmux-acpower.service. Mirrors what GiMATE's GpuPowerGear
+# service does on Windows.
+#
+# Safety: never runs in Discrete mux mode — the dGPU owns the panel there.
+# On battery, eject only succeeds if the nvidia stack unloads cleanly
+# (i.e. nothing is using the GPU); otherwise RTD3 keeps it suspended anyway.
+
+log() { logger -t gbmux-acpower "$1"; }
+
+# AC state: online if any Mains-type supply reports online
+online=0
+for p in /sys/class/power_supply/*; do
+    [ "$(cat "$p/type" 2>/dev/null)" = Mains ] || continue
+    [ "$(cat "$p/online" 2>/dev/null)" = 1 ] && online=1
+done
+
+mode=$(/usr/sbin/gbmux mode 2>/dev/null) || { log "gbmux mode read failed"; exit 0; }
+if [ "$mode" = 1 ]; then
+    log "Discrete mux mode — AC policy skipped"
+    exit 0
+fi
+
+if [ "$online" = 0 ]; then
+    modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null
+    if /usr/sbin/gbmux gpu off >/dev/null 2>&1; then
+        log "on battery: dGPU ejected"
+    else
+        log "on battery: eject refused (nvidia in use) — RTD3 still suspends it"
+    fi
+else
+    if /usr/sbin/gbmux gpu on >/dev/null 2>&1; then
+        modprobe nvidia nvidia_modeset nvidia_drm 2>/dev/null
+        log "on AC: dGPU powered on"
+    else
+        log "on AC: dGPU power-on failed"
+    fi
+fi
+exit 0

@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# gbmux — Gigabyte AERO X16 display-mux / dGPU-power control for Linux.
+# Mirrors GiMATE's "GPU Mux Switch" + GpuPowerGear dGPU-off feature.
+#
+# Paths (from DSDT disassembly, AERO X16 1WH BIOS FB07):
+#   get mode : \_SB.PCI0.AMW0.WMBC(0, 0xE6, buf) -> RXCM(0xD0) & 0x7F
+#   set mode : \_SB.PCI0.AMW0.WMBD(0, 0xE6, {b}) -> WXCM(0xD0, b)   (EC mailbox)
+#   dGPU on  : \_SB.PCI0.AMW0.WMBD(0, 0x51, {4}) -> WXCM(0xC7,0) + PEGP._ON + rescan
+#   dGPU off : \_SB.PCI0.AMW0.WMBD(0, 0x51, {3}) -> WXCM(0xC7,1) + Notify(PEGP,eject)
+#
+# mode byte: 0=Dynamic (BIOS hybrid), 1=Discrete (dGPU only), 2=MsHybrid
+# Mux mode is applied by the EC at next POST -> reboot required (same as Windows).
+set -uo pipefail
+
+CALL=/proc/acpi/call
+AMW0='\_SB.PCI0.AMW0'
+GUID_SET=/sys/bus/wmi/devices/ABBC0F75-8EA1-11D1-00A0-C90629100000-2
+
+die() { echo "gbmux: $*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "needs root — run via sudo"
+[[ -d /sys/bus/wmi/devices ]] && compgen -G '/sys/bus/wmi/devices/ABBC0F75-*' >/dev/null \
+    || die "Gigabyte WMI interface (ABBC0F75) not present — unsupported machine"
+[[ -e $CALL ]] || modprobe acpi_call 2>/dev/null
+[[ -e $CALL ]] || die "acpi_call not available (install acpi-call-dkms)"
+
+acall() {
+    echo "$1" > $CALL 2>/dev/null || die "write failed: $1"
+    local out; out=$(tr -d '\0' < $CALL)
+    case "$out" in *Error*|*rror:*) die "ACPI call failed: $1 -> $out";; esac
+    printf '%s' "$out"
+}
+
+mode_name() { case "$1" in 0) echo Dynamic;; 1) echo Discrete;; 2) echo MsHybrid;; *) echo "unknown($1)";; esac; }
+
+get_mode() {
+    local out; out=$(acall "$AMW0.WMBC 0 0xE6 {0}")
+    [[ "$out" =~ ^0x([0-9a-fA-F]+)$ ]] || die "WMBC 0xE6 returned: $out"
+    printf '%d' "0x${BASH_REMATCH[1]}"
+}
+
+dgpu_present() { lspci -d 10de: 2>/dev/null | grep -q .; }
+dgpu_bound()   { lspci -d 10de: -k 2>/dev/null | grep -q 'Kernel driver in use: nvidia'; }
+
+rescan_pci() {
+    for _ in $(seq 1 40); do
+        dgpu_present && return 0
+        echo 1 > /sys/bus/pci/rescan 2>/dev/null
+        sleep 0.25
+    done
+    return 1
+}
+
+case "${1:-}" in
+  status)
+    m=$(get_mode)
+    echo "mux mode   : $(mode_name "$m") (0x$(printf %x "$m"))"
+    if dgpu_present; then
+      echo "dGPU       : on PCI bus"; lspci -d 10de: -nn | sed 's/^/             /'
+      dgpu_bound && echo "             driver: nvidia bound" || echo "             driver: not nvidia/unbound"
+    else
+      echo "dGPU       : powered off (D3cold)"
+    fi
+    ;;
+  mode)
+    get_mode; echo
+    ;;
+  dynamic|discrete|hybrid)
+    case "$1" in dynamic) v=0;; discrete) v=1;; hybrid) v=2;; esac
+    acall "$AMW0.WMBD 0 0xE6 { $v }" >/dev/null
+    new=$(get_mode)
+    echo "mux mode now: $(mode_name "$new")"
+    echo "takes effect at next POST — reboot to apply"
+    ;;
+  gpu)
+    case "${2:-}" in
+      on)
+        acall "$AMW0.WMBD 0 0x51 { 0x04 }" >/dev/null
+        if rescan_pci; then
+          echo "dGPU powered on:"; lspci -d 10de: -nn | sed 's/^/  /'
+        else
+          echo "no NVIDIA device after power-on — check dmesg" >&2; exit 1
+        fi
+        ;;
+      off)
+        dgpu_bound && die "nvidia driver bound — unbind/remove it first (refusing to pull power)"
+        acall "$AMW0.WMBD 0 0x51 { 0x03 }" >/dev/null
+        echo "dGPU power-off issued"
+        ;;
+      *) die "usage: gbmux gpu on|off";;
+    esac
+    ;;
+  call)  # escape hatch: gbmux call '\_SB.PCI0.AMW0.WMBC 0 0xE6 {0}'
+    [[ -n "${2:-}" ]] || die "usage: gbmux call '<acpi expression>'"
+    acall "$2"; echo
+    ;;
+  *) cat <<'EOF'
+gbmux — Gigabyte AERO X16 mux/dGPU control
+  gbmux status            show mux mode + dGPU state
+  gbmux mode              print raw mux mode (0=Dynamic 1=Discrete 2=MsHybrid)
+  gbmux dynamic           hybrid (BIOS auto, iGPU drives panel)  [reboot]
+  gbmux discrete          dGPU-only mode                          [reboot]
+  gbmux hybrid            MS-hybrid mode                          [reboot]
+  gbmux gpu on            power dGPU onto the PCI bus (runtime)
+  gbmux gpu off           power dGPU off (runtime; refuses if nvidia bound)
+  gbmux call '<expr>'     raw acpi_call (debug)
+EOF
+    ;;
+esac

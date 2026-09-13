@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+# Load acpi_call if the dkms module is already built for the running kernel.
+modprobe acpi_call 2>/dev/null || true
+# Remove a stale manual install to avoid two copies on PATH.
+rm -f /usr/local/bin/gbmux /usr/local/bin/gbmux-setup
+# Pick up the udev rule and enable the AC/battery power policy.
+udevadm control --reload 2>/dev/null || true
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable gbmux-acpower.service 2>/dev/null || true
+fi
+exit 0

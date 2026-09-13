@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# gbmux-setup — install the pinned NVIDIA driver for GB206M (RTX 5070 mobile).
+# Safe to re-run; refuses when nouveau is live (reboot with blacklist first).
+set -uo pipefail
+
+VER=615.71.09
+URL="https://us.download.nvidia.com/XFree86/Linux-x86_64/${VER}/NVIDIA-Linux-x86_64-${VER}.run"
+DEST="/var/cache/gbmux/NVIDIA-Linux-x86_64-${VER}.run"
+
+die() { echo "gbmux-setup: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "needs root"
+
+if [[ -f /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c ]]; then
+    sb=$(od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c | tr -d ' ')
+    [[ "$sb" == "1" ]] && die "Secure Boot is ON — unsigned nvidia modules won't load. Disable SB or enroll a MOK first."
+fi
+
+if lsmod | grep -q '^nouveau'; then
+    echo "nouveau is loaded. Write /etc/modprobe.d/blacklist-nouveau.conf,"
+    echo "run update-initramfs -u, reboot, then re-run this script."
+    exit 1
+fi
+
+mkdir -p /var/cache/gbmux
+if [[ ! -f $DEST ]]; then
+    echo "downloading $URL"
+    curl -fSL --retry 3 -o "$DEST" "$URL" || die "download failed"
+fi
+chmod +x "$DEST"
+sh "$DEST" --check || die "archive corrupt — delete $DEST and retry"
+sh "$DEST" --silent --accept-license --dkms --no-x-check || die "installer failed — see /var/log/nvidia-installer.log"
+
+modprobe nvidia nvidia_modeset nvidia_uvm nvidia_drm 2>/dev/null
+nvidia-smi && echo && echo "done — PRIME offload: __NV_PRIME_RENDER_OFFLOAD=1 <cmd>"
