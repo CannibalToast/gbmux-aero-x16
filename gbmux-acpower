@@ -5,9 +5,15 @@
 # at boot via gbmux-acpower.service. Mirrors what GiMATE's GpuPowerGear
 # service does on Windows.
 #
-# Safety: never runs in Discrete mux mode — the dGPU owns the panel there.
-# On battery, eject only succeeds if the nvidia stack unloads cleanly
-# (i.e. nothing is using the GPU); otherwise RTD3 keeps it suspended anyway.
+# Safety rules (learned the hard way):
+# - Never runs in Discrete mux mode — the dGPU owns the panel there.
+# - Never ejects while compute clients hold /dev/nvidia* fds — the driver
+#   remove path waits on them and wedges. RTD3 covers that case instead.
+# - Audio function (.1) must be unbound BEFORE the GPU (.0): snd_card_free
+#   hangs on a powered-down/dead codec if the order is flipped.
+
+VGA=0000:64:00.0
+AUD=0000:64:00.1
 
 log() { logger -t gbmux-acpower "$1"; }
 
@@ -24,19 +30,37 @@ if [ "$mode" = 1 ]; then
     exit 0
 fi
 
-if [ "$online" = 0 ]; then
-    modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null
-    if /usr/sbin/gbmux gpu off >/dev/null 2>&1; then
-        log "on battery: dGPU ejected"
-    else
-        log "on battery: eject refused (nvidia in use) — RTD3 still suspends it"
-    fi
-else
+if [ "$online" = 1 ]; then
     if /usr/sbin/gbmux gpu on >/dev/null 2>&1; then
         modprobe nvidia nvidia_modeset nvidia_drm 2>/dev/null
         log "on AC: dGPU powered on"
     else
         log "on AC: dGPU power-on failed"
     fi
+    exit 0
+fi
+
+# --- on battery: try to eject the dGPU ---
+
+# Compute/control fds (CUDA, NVENC, nvidia-smi loops) pin the driver's
+# remove path; kwin's /dev/dri/card* fds do not. Eject only if none held.
+pids=$(fuser /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null)
+if [ -n "$pids" ]; then
+    log "on battery: GPU held by $(ps -o comm= -p $pids 2>/dev/null | sort -u | tr '\n' ' ')— not ejecting (RTD3 may still suspend it)"
+    exit 0
+fi
+
+# Audio first, while the chip is still powered: snd_card_free needs it alive.
+[ -d /sys/bus/pci/devices/$AUD/driver ] &&
+    echo "$AUD" > "/sys/bus/pci/drivers/snd_hda_intel/unbind" 2>/dev/null
+# Then the GPU function.
+[ -d /sys/bus/pci/devices/$VGA/driver ] &&
+    echo "$VGA" > /sys/bus/pci/drivers/nvidia/unbind 2>/dev/null
+modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null
+
+if /usr/sbin/gbmux gpu off >/dev/null 2>&1; then
+    log "on battery: dGPU ejected"
+else
+    log "on battery: eject failed — see journal"
 fi
 exit 0
