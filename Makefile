@@ -35,7 +35,11 @@ deb:
 	$(MAKE) install DESTDIR=$(PKG) PREFIX=/usr
 	mkdir -p $(PKG)/DEBIAN
 	install -m644 debian/control $(PKG)/DEBIAN/
+	install -m644 debian/conffiles $(PKG)/DEBIAN/
 	install -m755 debian/postinst debian/prerm $(PKG)/DEBIAN/
 	dpkg-deb --root-owner-group --build $(PKG)
 
-.PHONY: install uninstall deb
+test:
+	bash tests/run.sh
+
+.PHONY: install uninstall deb test

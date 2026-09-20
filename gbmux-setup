@@ -4,10 +4,60 @@
 set -uo pipefail
 
 VER=615.71.09
-URL="https://us.download.nvidia.com/XFree86/Linux-x86_64/${VER}/NVIDIA-Linux-x86_64-${VER}.run"
-DEST="/var/cache/gbmux/NVIDIA-Linux-x86_64-${VER}.run"
+# NVIDIA-published digest: .../615.71.09/NVIDIA-Linux-x86_64-615.71.09.run.sha256sum
+SHA256=${GBMUX_SETUP_SHA256:-cdceed22bbeb61248d1a6deabc2596673e3a6501698ee71ac8d2fdc28f3b70fe}
+URL=${GBMUX_SETUP_URL:-"https://us.download.nvidia.com/XFree86/Linux-x86_64/${VER}/NVIDIA-Linux-x86_64-${VER}.run"}
+DEST=${GBMUX_SETUP_DEST:-"/var/cache/gbmux/NVIDIA-Linux-x86_64-${VER}.run"}
 
 die() { echo "gbmux-setup: $*" >&2; exit 1; }
+
+verify_installer() {
+    local dest=$1 expected=$2 got
+    [[ -f "$dest" && ! -L "$dest" ]] || return 1
+    got=$(sha256sum "$dest" | awk '{print $1}')
+    [[ "$got" == "$expected" ]]
+}
+
+ensure_installer() {
+    DEST=${GBMUX_SETUP_DEST:-$DEST}
+    SHA256=${GBMUX_SETUP_SHA256:-$SHA256}
+    URL=${GBMUX_SETUP_URL:-$URL}
+    local dest=$DEST part=${DEST}.part
+    mkdir -p "$(dirname "$dest")"
+    if [[ ! -f $dest ]]; then
+        echo "downloading $URL"
+        umask 077
+        rm -f "$part"
+        curl --fail --proto '=https' --tlsv1.2 --retry 3 -o "$part" "$URL" || {
+            rm -f "$part"
+            echo "gbmux-setup: download failed" >&2
+            return 1
+        }
+        if ! verify_installer "$part" "$SHA256"; then
+            rm -f "$part"
+            echo "gbmux-setup: SHA256 mismatch after download — deleted $part (expected $SHA256)" >&2
+            return 1
+        fi
+        mv -f "$part" "$dest"
+    fi
+    if ! verify_installer "$dest" "$SHA256"; then
+        rm -f "$dest"
+        echo "gbmux-setup: SHA256 mismatch — deleted $dest (expected $SHA256)" >&2
+        return 1
+    fi
+}
+
+if [[ "${GBMUX_SETUP_LIB:-}" == 1 ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+# Test-only: verify hash/download without becoming root or executing the payload.
+if [[ "${GBMUX_SETUP_DRY_RUN:-}" == 1 && "${GBMUX_SETUP_ALLOW_NONROOT:-}" == 1 ]]; then
+    ensure_installer || exit 1
+    echo "gbmux-setup: installer hash ok"
+    exit 0
+fi
+
 [[ $EUID -eq 0 ]] || die "needs root"
 
 if [[ -f /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c ]]; then
@@ -21,13 +71,23 @@ if lsmod | grep -q '^nouveau'; then
     exit 1
 fi
 
-mkdir -p /var/cache/gbmux
-if [[ ! -f $DEST ]]; then
-    echo "downloading $URL"
-    curl -fSL --retry 3 -o "$DEST" "$URL" || die "download failed"
+ensure_installer || exit 1
+
+if [[ "${GBMUX_SETUP_DRY_RUN:-}" == 1 ]]; then
+    echo "gbmux-setup: installer hash ok"
+    exit 0
 fi
-chmod +x "$DEST"
+
+# Re-hash immediately before any execution (cache hit or fresh download).
+if ! verify_installer "$DEST" "$SHA256"; then
+    rm -f "$DEST"
+    die "SHA256 mismatch — deleted $DEST (expected $SHA256)"
+fi
 sh "$DEST" --check || die "archive corrupt — delete $DEST and retry"
+if ! verify_installer "$DEST" "$SHA256"; then
+    rm -f "$DEST"
+    die "SHA256 mismatch after --check — deleted $DEST (expected $SHA256)"
+fi
 sh "$DEST" --silent --accept-license --dkms --no-x-check || die "installer failed — see /var/log/nvidia-installer.log"
 
 modprobe nvidia nvidia_modeset nvidia_uvm nvidia_drm 2>/dev/null

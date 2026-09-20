@@ -21,7 +21,7 @@ gbmux discrete          dGPU owns panel                              [reboot]
 gbmux hybrid            MS-hybrid                                    [reboot]
 gbmux gpu on            power dGPU onto the PCI bus (runtime)
 gbmux gpu off           eject dGPU (runtime; refuses if nvidia bound)
-gbmux call '<expr>'     raw acpi_call (debug)
+gbmux call '<expr>'     acpi_call allowlisted to AMW0 WMBC/WMBD 0xE6|0x51
 gbmux-setup             download + install the pinned NVIDIA driver
 ```
 
@@ -92,6 +92,7 @@ sudo dpkg -i gbmux_1.0-1_all.deb     # or: sudo make install
 Build the .deb yourself: `make deb` (needs `dpkg-deb`).
 
 Then `sudo gbmux-setup` for the pinned NVIDIA driver (615.71.09).
+The installer is SHA256-verified on every run, including cache hits.
 **nouveau must be blacklisted** — it wedges the display on GB206; the
 package ships `gbmux-nouveau.conf`. If nouveau was already loading, run
 `sudo update-initramfs -u` and reboot before installing the NVIDIA driver.
