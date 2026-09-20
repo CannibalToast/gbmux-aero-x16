@@ -5,9 +5,9 @@ set -uo pipefail
 
 VER=615.71.09
 # NVIDIA-published digest: .../615.71.09/NVIDIA-Linux-x86_64-615.71.09.run.sha256sum
-SHA256=${GBMUX_SETUP_SHA256:-cdceed22bbeb61248d1a6deabc2596673e3a6501698ee71ac8d2fdc28f3b70fe}
-URL=${GBMUX_SETUP_URL:-"https://us.download.nvidia.com/XFree86/Linux-x86_64/${VER}/NVIDIA-Linux-x86_64-${VER}.run"}
-DEST=${GBMUX_SETUP_DEST:-"/var/cache/gbmux/NVIDIA-Linux-x86_64-${VER}.run"}
+SHA256=cdceed22bbeb61248d1a6deabc2596673e3a6501698ee71ac8d2fdc28f3b70fe
+URL="https://us.download.nvidia.com/XFree86/Linux-x86_64/${VER}/NVIDIA-Linux-x86_64-${VER}.run"
+DEST="/var/cache/gbmux/NVIDIA-Linux-x86_64-${VER}.run"
 
 die() { echo "gbmux-setup: $*" >&2; exit 1; }
 
@@ -18,42 +18,51 @@ verify_installer() {
     [[ "$got" == "$expected" ]]
 }
 
+# Optional args (tests only): dest, sha256, url. Production always uses the pins.
 ensure_installer() {
-    DEST=${GBMUX_SETUP_DEST:-$DEST}
-    SHA256=${GBMUX_SETUP_SHA256:-$SHA256}
-    URL=${GBMUX_SETUP_URL:-$URL}
-    local dest=$DEST part=${DEST}.part
-    mkdir -p "$(dirname "$dest")"
+    local dest=${1:-$DEST} expected=${2:-$SHA256} url=${3:-$URL}
+    local part=${dest}.part old_umask
+    mkdir -p "$(dirname "$dest")" || {
+        echo "gbmux-setup: cannot create $(dirname "$dest")" >&2
+        return 1
+    }
     if [[ ! -f $dest ]]; then
-        echo "downloading $URL"
+        echo "downloading $url"
+        old_umask=$(umask)
         umask 077
         rm -f "$part"
-        curl --fail --proto '=https' --tlsv1.2 --retry 3 -o "$part" "$URL" || {
+        if ! curl --fail --proto '=https' --tlsv1.2 --retry 3 -o "$part" "$url"; then
             rm -f "$part"
+            umask "$old_umask"
             echo "gbmux-setup: download failed" >&2
             return 1
-        }
-        if ! verify_installer "$part" "$SHA256"; then
+        fi
+        if ! verify_installer "$part" "$expected"; then
             rm -f "$part"
-            echo "gbmux-setup: SHA256 mismatch after download — deleted $part (expected $SHA256)" >&2
+            umask "$old_umask"
+            echo "gbmux-setup: SHA256 mismatch after download — deleted $part (expected $expected)" >&2
             return 1
         fi
         mv -f "$part" "$dest"
+        umask "$old_umask"
     fi
-    if ! verify_installer "$dest" "$SHA256"; then
+    if ! verify_installer "$dest" "$expected"; then
         rm -f "$dest"
-        echo "gbmux-setup: SHA256 mismatch — deleted $dest (expected $SHA256)" >&2
+        echo "gbmux-setup: SHA256 mismatch — deleted $dest (expected $expected)" >&2
         return 1
     fi
 }
 
 if [[ "${GBMUX_SETUP_LIB:-}" == 1 ]]; then
-    return 0 2>/dev/null || exit 0
+    return 0 2>/dev/null || true
 fi
 
-# Test-only: verify hash/download without becoming root or executing the payload.
+# Test-only entrypoint: hash/download without becoming root or executing the payload.
 if [[ "${GBMUX_SETUP_DRY_RUN:-}" == 1 && "${GBMUX_SETUP_ALLOW_NONROOT:-}" == 1 ]]; then
-    ensure_installer || exit 1
+    ensure_installer \
+        "${GBMUX_SETUP_DEST:-$DEST}" \
+        "${GBMUX_SETUP_SHA256:-$SHA256}" \
+        "${GBMUX_SETUP_URL:-$URL}" || exit 1
     echo "gbmux-setup: installer hash ok"
     exit 0
 fi

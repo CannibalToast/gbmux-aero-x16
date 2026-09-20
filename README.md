@@ -85,7 +85,7 @@ Use Dynamic + `prime-run <app>` for per-app dGPU rendering instead.
 ## Install
 
 ```
-sudo apt install acpi-call-dkms pciutils
+sudo apt install acpi-call-dkms pciutils curl psmisc procps
 sudo dpkg -i gbmux_1.0-1_all.deb     # or: sudo make install
 ```
 

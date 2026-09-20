@@ -61,6 +61,12 @@ if [ "$rc" -ne 0 ] && printf '%s' "$setup_err" | grep -q 'needs root'; then
 else
     bad "gbmux-setup without root: rc=$rc err=$setup_err"
 fi
+lib_err=$(GBMUX_LIB=1 bash "$ROOT/gbmux" 2>&1) && rc=0 || rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$lib_err" | grep -q 'needs root'; then
+    ok "GBMUX_LIB=1 does not no-op an executed gbmux"
+else
+    bad "GBMUX_LIB=1 executed gbmux: rc=$rc err=$lib_err"
+fi
 
 # --- source helper libraries (must not run privileged mains) ---
 GBMUX_LIB=1
@@ -149,23 +155,21 @@ else
     bad "SHA256 not pinned (got '${SHA256:-}')"
 fi
 
+cache=$tmpdir/cache.run
 # ensure_installer: cache hit re-hashes; mismatch deletes and fails
-export GBMUX_SETUP_DEST="$tmpdir/cache.run"
-export GBMUX_SETUP_SHA256="$hello_hash"
-export GBMUX_SETUP_URL="https://example.invalid/nvidia.run"
-printf 'hello\n' >"$GBMUX_SETUP_DEST"
-if ensure_installer; then
+printf 'hello\n' >"$cache"
+if ensure_installer "$cache" "$hello_hash" "https://example.invalid/nvidia.run"; then
     ok "ensure_installer cache hit with good hash"
 else
     bad "ensure_installer cache hit with good hash"
 fi
-printf 'TAMPERED\n' >"$GBMUX_SETUP_DEST"
-if ensure_installer 2>"$tmpdir/ensure.err"; then
+printf 'TAMPERED\n' >"$cache"
+if ensure_installer "$cache" "$hello_hash" "https://example.invalid/nvidia.run" 2>"$tmpdir/ensure.err"; then
     bad "ensure_installer must fail on tainted cache"
 else
     ok "ensure_installer fails on tainted cache"
 fi
-if [ ! -f "$GBMUX_SETUP_DEST" ]; then
+if [ ! -f "$cache" ]; then
     ok "tainted cache deleted"
 else
     bad "tainted cache still present"
@@ -174,6 +178,23 @@ if grep -q 'SHA256' "$tmpdir/ensure.err"; then
     ok "tainted cache reports SHA256 mismatch"
 else
     bad "tainted cache error missing SHA256"
+fi
+
+# production pin is a literal; zero-arg ensure_installer uses script constants
+if grep -q 'SHA256=${GBMUX_SETUP_SHA256' "$ROOT/gbmux-setup"; then
+    bad "SHA256 still env-overridable at parse time"
+else
+    ok "SHA256 is a literal pin"
+fi
+if grep -A2 '^ensure_installer()' "$ROOT/gbmux-setup" | grep -q 'GBMUX_SETUP_DEST='; then
+    bad "ensure_installer still rereads DEST from env"
+else
+    ok "ensure_installer does not reread DEST from env"
+fi
+if [ "$DEST" = "/var/cache/gbmux/NVIDIA-Linux-x86_64-615.71.09.run" ]; then
+    ok "DEST pin is the NVIDIA installer cache path"
+else
+    bad "DEST pin unexpected: $DEST"
 fi
 
 # download path: DEST.part then mv only after hash; no chmod +x required
@@ -193,28 +214,39 @@ printf 'hello\n' >"$out"
 EOF
 chmod +x "$tmpdir/bin/curl"
 export PATH="$tmpdir/bin:$PATH"
-export GBMUX_SETUP_DEST="$tmpdir/dl.run"
-rm -f "$GBMUX_SETUP_DEST" "${GBMUX_SETUP_DEST}.part"
-if ensure_installer; then
+dl=$tmpdir/dl.run
+rm -f "$dl" "${dl}.part"
+umask 022
+before_umask=$(umask)
+if ensure_installer "$dl" "$hello_hash" "https://example.invalid/nvidia.run"; then
     ok "ensure_installer download+hash then mv"
 else
     bad "ensure_installer download+hash then mv"
 fi
-if [ -f "$GBMUX_SETUP_DEST" ] && [ ! -f "${GBMUX_SETUP_DEST}.part" ]; then
+after_umask=$(umask)
+if [ "$before_umask" = "$after_umask" ]; then
+    ok "ensure_installer restores umask after download"
+else
+    bad "umask leaked: before=$before_umask after=$after_umask"
+fi
+if [ -f "$dl" ] && [ ! -f "${dl}.part" ]; then
     ok "DEST.part removed after successful mv"
 else
     bad "DEST.part leftover or DEST missing"
 fi
-if [ ! -x "$GBMUX_SETUP_DEST" ]; then
+if [ ! -x "$dl" ]; then
     ok "installer not marked executable"
 else
     bad "installer was chmod +x"
 fi
 
-# dry-run: verify only, do not invoke sh on the payload
+# dry-run test entrypoint: verify only, do not invoke sh on the payload
 export GBMUX_SETUP_DRY_RUN=1
 export GBMUX_SETUP_ALLOW_NONROOT=1
-printf 'hello\n' >"$GBMUX_SETUP_DEST"
+export GBMUX_SETUP_DEST=$dl
+export GBMUX_SETUP_SHA256=$hello_hash
+export GBMUX_SETUP_URL=https://example.invalid/nvidia.run
+printf 'hello\n' >"$dl"
 dry=$(bash "$ROOT/gbmux-setup" 2>&1) && rc=0 || rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$dry" | grep -q 'hash ok'; then
     ok "gbmux-setup dry-run cache hit verifies hash"
@@ -229,6 +261,14 @@ else
 fi
 unset GBMUX_SETUP_DRY_RUN GBMUX_SETUP_ALLOW_NONROOT
 unset GBMUX_SETUP_DEST GBMUX_SETUP_SHA256 GBMUX_SETUP_URL
+
+# ALLOW_NONROOT alone must not skip the root gate or run sh
+allow_out=$(GBMUX_SETUP_ALLOW_NONROOT=1 bash "$ROOT/gbmux-setup" 2>&1) && allow_rc=0 || allow_rc=$?
+if [ "$allow_rc" -ne 0 ] && printf '%s' "$allow_out" | grep -q 'needs root'; then
+    ok "ALLOW_NONROOT alone still requires root"
+else
+    bad "ALLOW_NONROOT alone: rc=$allow_rc out=$allow_out"
+fi
 
 # --- HIGH-3: parse config, never source ---
 if grep -n '[[:space:]]\. /etc/gbmux-acpower.conf' "$ROOT/gbmux-acpower" >/dev/null; then
@@ -312,6 +352,16 @@ if [ -f "$ROOT/debian/conffiles" ] && grep -qx '/etc/gbmux-acpower.conf' "$ROOT/
     ok "debian/conffiles lists acpower conf"
 else
     bad "debian/conffiles missing /etc/gbmux-acpower.conf"
+fi
+if grep -qx '/etc/modprobe.d/gbmux-nouveau.conf' "$ROOT/debian/conffiles"; then
+    ok "debian/conffiles lists nouveau conf"
+else
+    bad "debian/conffiles missing nouveau conf"
+fi
+if grep -qx '/etc/udev/rules.d/99-gbmux-acpower.rules' "$ROOT/debian/conffiles"; then
+    ok "debian/conffiles lists udev rule"
+else
+    bad "debian/conffiles missing udev rule"
 fi
 
 # numeric PID helper

@@ -147,7 +147,7 @@ load_kill_on_battery() {
 }
 
 if [ "${GBMUX_ACPOWER_LIB:-}" = 1 ]; then
-    return 0 2>/dev/null || exit 0
+    return 0 2>/dev/null || true
 fi
 
 # Serialize overlapping udev oneshots (unbind vs gpu on). Separate from

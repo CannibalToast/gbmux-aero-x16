@@ -58,7 +58,7 @@ rescan_pci() {
 }
 
 if [[ "${GBMUX_LIB:-}" == 1 ]]; then
-    return 0 2>/dev/null || exit 0
+    return 0 2>/dev/null || true
 fi
 
 [[ $EUID -eq 0 ]] || die "needs root — run via sudo"
@@ -120,7 +120,7 @@ gbmux — Gigabyte AERO X16 mux/dGPU control
   gbmux hybrid            MS-hybrid mode                          [reboot]
   gbmux gpu on            power dGPU onto the PCI bus (runtime)
   gbmux gpu off           power dGPU off (runtime; refuses if nvidia bound)
-  gbmux call '<expr>'     raw acpi_call (debug)
+  gbmux call '<expr>'     acpi_call allowlisted to AMW0 WMBC/WMBD 0xE6|0x51
 EOF
     ;;
 esac
