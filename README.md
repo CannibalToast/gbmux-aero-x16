@@ -45,8 +45,12 @@ No custom kernel module — just `acpi_call` and sysfs.
 
 ## AC/battery automation
 
-`gbmux-acpower.service` runs at boot and on every AC adapter change
-(`99-gbmux-acpower.rules`), mirroring GpuPowerGear:
+`gbmux-acpower.service` runs at boot and when the internal AC adapter
+changes (`99-gbmux-acpower.rules`), mirroring GpuPowerGear. Only supplies
+named `ACAD` or `ADP*` are trusted. A USB device that registers as type
+Mains under another name does not flip dGPU policy. The NVIDIA functions
+are chosen by PCI vendor `10de` and class (display vs HD-audio), not a
+hardcoded bus address.
 
 - **on battery**: unloads the nvidia stack if idle, then ejects the dGPU
   (deeper than RTD3). If busy, eject is refused and RTD3 keeps it suspended.
@@ -78,7 +82,8 @@ Verified exhaustively — this board's mux is POST-only hardware:
 - vgaswitcheroo: amdgpu detects ATPX, but nvidia-drm never registers.
 - NVIDIA NVKMS internal-mux API: `NVKMS_IOCTL_QUERY_DISP` reports
   `muxDisplays` empty — GSP has no mux topology for the internal eDP
-  (see `tools/muxq.c`, a read-only probe you can re-run on future drivers).
+  (see `tools/muxq.c`, a read-only probe you can re-run on future drivers;
+  `--grant-permissions` is required before it will take DRM master).
 
 Use Dynamic + `prime-run <app>` for per-app dGPU rendering instead.
 
@@ -96,7 +101,24 @@ The installer is SHA256-verified on every run, including cache hits.
 **nouveau must be blacklisted** — it wedges the display on GB206; the
 package ships `gbmux-nouveau.conf`. If nouveau was already loading, run
 `sudo update-initramfs -u` and reboot before installing the NVIDIA driver.
-Secure Boot must be off (or enroll a MOK) for unsigned modules.
+Unsigned NVIDIA modules need a Machine Owner Key while Secure Boot stays
+on. Enroll one and reboot:
+
+```
+sudo mokutil --import /path/to/MOK.der
+```
+
+`gbmux-setup` reads the EFI Secure Boot variable and stops if that byte
+cannot be read on an EFI system, or if Secure Boot is on. Turning Secure
+Boot off also lets the modules load; that is not the default recommendation.
+
+The package does not enable `gbmux-acpower.service` unless the Gigabyte WMI
+GUID `ABBC0F75-*` is present. Optional confinement samples (not loaded or
+installed into `/etc` by the package):
+
+- AppArmor: `/usr/share/doc/gbmux/apparmor/usr.sbin.gbmux`
+- sudoers: `/usr/share/doc/gbmux/examples/gbmux.sudoers` (commented; no
+  `call`, no `gbmux-setup`)
 
 ## Recovery
 

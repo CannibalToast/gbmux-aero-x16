@@ -1,4 +1,8 @@
-# AERO X16: apply dGPU power policy on AC adapter changes.
+# AERO X16: apply dGPU power policy on internal AC adapter changes.
 # Spawns a systemd oneshot instead of blocking udev.
-ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", \
+# KERNEL is the power_supply name. ACAD is this board's adapter; ADP* is the
+# ACPI generic name. A USB gadget that only advertises type=Mains is ignored.
+ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", KERNEL=="ACAD", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}="gbmux-acpower.service"
+ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", KERNEL=="ADP*", \
     TAG+="systemd", ENV{SYSTEMD_WANTS}="gbmux-acpower.service"

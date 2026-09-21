@@ -213,7 +213,8 @@ done
 printf 'hello\n' >"$out"
 EOF
 chmod +x "$tmpdir/bin/curl"
-export PATH="$tmpdir/bin:$PATH"
+# Absolute GBMUX_CURL is the only override. A PATH entry named curl must not win.
+export GBMUX_CURL="$tmpdir/bin/curl"
 dl=$tmpdir/dl.run
 rm -f "$dl" "${dl}.part"
 umask 022
@@ -261,6 +262,7 @@ else
 fi
 unset GBMUX_SETUP_DRY_RUN GBMUX_SETUP_ALLOW_NONROOT
 unset GBMUX_SETUP_DEST GBMUX_SETUP_SHA256 GBMUX_SETUP_URL
+unset GBMUX_CURL
 
 # ALLOW_NONROOT alone must not skip the root gate or run sh
 allow_out=$(GBMUX_SETUP_ALLOW_NONROOT=1 bash "$ROOT/gbmux-setup" 2>&1) && allow_rc=0 || allow_rc=$?
@@ -459,6 +461,441 @@ if command -v dash >/dev/null 2>&1; then
     fi
 else
     ok "dash not installed — skip POSIX parser re-check"
+fi
+
+# --- Medium/Low remediations (no AERO hardware) ---
+
+# privileged CLIs must not use env-bash (PATH hijack under sudo)
+for priv in gbmux gbmux-setup; do
+    shebang=$(head -n 1 "$ROOT/$priv")
+    if [ "$shebang" = '#!/bin/bash' ]; then
+        ok "$priv shebang is /bin/bash"
+    else
+        bad "$priv shebang is $shebang"
+    fi
+done
+
+# ACPI writes use printf, not echo (echo treats -n/-e as flags)
+if grep -q "printf '%s\\\\n' \"\$1\"" "$ROOT/gbmux" && ! grep -q 'echo "\$1"' "$ROOT/gbmux"; then
+    ok "acall writes with printf"
+else
+    bad "acall still uses echo for the ACPI payload"
+fi
+
+# absolute helpers: PATH cannot substitute modprobe/fuser/logger/curl
+if grep -E '(^|[^/])modprobe( |$)' "$ROOT/gbmux-acpower" | grep -v 'MODPROBE=' | grep -v '/modprobe' | grep -v '^#'; then
+    bad "gbmux-acpower still invokes modprobe via PATH"
+else
+    ok "gbmux-acpower does not invoke bare modprobe"
+fi
+if grep -n 'fuser' "$ROOT/gbmux-acpower" | grep -v 'FUSER' | grep -v 'fuser not found' | grep -v 'fuser_available'; then
+    bad "gbmux-acpower still invokes bare fuser"
+else
+    ok "gbmux-acpower does not invoke bare fuser"
+fi
+if grep -E '(^|[^$./[:alnum:]_])logger ' "$ROOT/gbmux-acpower"; then
+    bad "gbmux-acpower still invokes bare logger"
+else
+    ok "gbmux-acpower does not invoke bare logger"
+fi
+case "$FUSER" in
+    /*) ok "FUSER is an absolute path ($FUSER)" ;;
+    *) bad "FUSER is not absolute ($FUSER)" ;;
+esac
+mkdir -p "$tmpdir/hijack"
+printf '#!/bin/sh\necho hijacked-fuser\n' >"$tmpdir/hijack/fuser"
+chmod +x "$tmpdir/hijack/fuser"
+oldpath=$PATH
+PATH="$tmpdir/hijack:$PATH"
+if fuser_available; then
+    bad "fuser_available followed PATH"
+else
+    ok "fuser_available ignores a PATH-injected fuser"
+fi
+PATH=$oldpath
+
+# curl download ignores PATH. Relative GBMUX_CURL is ignored too.
+printf '#!/bin/sh\necho hijacked >"$2"\nexit 0\n' >"$tmpdir/hijack/curl"
+chmod +x "$tmpdir/hijack/curl"
+hijack_dest=$tmpdir/hijack-dest.run
+rm -f "$hijack_dest"
+oldpath=$PATH
+PATH="$tmpdir/hijack:$PATH"
+GBMUX_CURL=curl
+if ensure_installer "$hijack_dest" "$hello_hash" "https://example.invalid/nvidia.run" 2>"$tmpdir/hijack.err"; then
+    bad "PATH curl must not satisfy ensure_installer"
+else
+    ok "PATH curl cannot satisfy ensure_installer"
+fi
+if [ ! -f "$hijack_dest" ]; then
+    ok "PATH curl did not create the installer"
+else
+    bad "PATH curl created $hijack_dest"
+fi
+unset GBMUX_CURL
+PATH=$oldpath
+
+# cache directory: not world-writable; symlink refused; production path named
+world=$tmpdir/world
+mkdir -p "$world"
+chmod 0777 "$world"
+if cache_dir_trusted "$world"; then
+    bad "world-writable cache dir must be refused"
+else
+    ok "world-writable cache dir refused"
+fi
+if prepare_cache_dir "$world" 2>"$tmpdir/world.err"; then
+    bad "prepare_cache_dir accepted world-writable dir"
+else
+    ok "prepare_cache_dir rejects world-writable dir"
+fi
+mkdir -p "$tmpdir/realcache"
+ln -s realcache "$tmpdir/linkcache"
+if prepare_cache_dir "$tmpdir/linkcache" 2>"$tmpdir/link.err"; then
+    bad "prepare_cache_dir accepted symlink"
+else
+    ok "prepare_cache_dir rejects symlink"
+fi
+locked=$tmpdir/locked
+mkdir -p "$locked"
+chmod 0755 "$locked"
+if cache_dir_trusted "$locked"; then
+    ok "0755 non-world-writable cache dir accepted for non-root tests"
+else
+    bad "0755 cache dir rejected"
+fi
+if grep -q -- '-d -m 0755 -o root -g root' "$ROOT/gbmux-setup"; then
+    ok "setup locks cache dir with install -d root:root 0755"
+else
+    bad "setup missing install -d root:root 0755"
+fi
+
+# Secure Boot: fail closed on EFI when the byte cannot be read
+sbroot=$tmpdir/efi
+rm -rf "$sbroot"
+sb=$(secure_boot_state "$sbroot") && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && [ "$sb" = skip ]; then
+    ok "missing EFI tree skips Secure Boot check"
+else
+    bad "missing EFI tree: rc=$rc sb=$sb"
+fi
+mkdir -p "$sbroot/efivars"
+sb=$(secure_boot_state "$sbroot") && rc=0 || rc=$?
+if [ "$rc" -ne 0 ]; then
+    ok "EFI without SecureBoot efivar fails closed"
+else
+    bad "EFI without efivar returned $sb"
+fi
+sbfile=$sbroot/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
+printf '\006\000\000\000\001' >"$sbfile"
+sb=$(secure_boot_state "$sbroot") && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && [ "$sb" = on ]; then
+    ok "Secure Boot byte 1 is on"
+else
+    bad "Secure Boot byte 1: rc=$rc sb=$sb"
+fi
+printf '\006\000\000\000\000' >"$sbfile"
+sb=$(secure_boot_state "$sbroot") && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && [ "$sb" = off ]; then
+    ok "Secure Boot byte 0 is off"
+else
+    bad "Secure Boot byte 0: rc=$rc sb=$sb"
+fi
+printf '\006\000\000\000\002' >"$sbfile"
+sb=$(secure_boot_state "$sbroot") && rc=0 || rc=$?
+if [ "$rc" -ne 0 ]; then
+    ok "unexpected Secure Boot byte fails closed"
+else
+    bad "unexpected Secure Boot byte returned $sb"
+fi
+printf 'short' >"$sbfile"
+sb=$(secure_boot_state "$sbroot") && rc=0 || rc=$?
+if [ "$rc" -ne 0 ]; then
+    ok "short SecureBoot efivar fails closed"
+else
+    bad "short SecureBoot efivar returned $sb"
+fi
+chmod 000 "$sbfile"
+sb=$(secure_boot_state "$sbroot") && rc=0 || rc=$?
+chmod 644 "$sbfile" || true
+if [ "$rc" -ne 0 ]; then
+    ok "unreadable SecureBoot efivar fails closed"
+else
+    bad "unreadable SecureBoot efivar returned $sb"
+fi
+
+# internal AC adapter only
+if ac_supply_name_trusted ACAD && ac_supply_name_trusted ADP0 && ac_supply_name_trusted ADP1; then
+    ok "ACAD and ADP* are trusted adapter names"
+else
+    bad "ACAD/ADP* trust"
+fi
+if ac_supply_name_trusted usb || ac_supply_name_trusted hidpp_battery_0 || ac_supply_name_trusted Mains || ac_supply_name_trusted AC0; then
+    bad "USB/other Mains names must not be trusted"
+else
+    ok "USB and non-ADP Mains names are not trusted"
+fi
+psroot=$tmpdir/ps
+mkdir -p "$psroot/ACAD" "$psroot/usb-gadget" "$psroot/BAT0"
+printf 'Mains\n' >"$psroot/ACAD/type"
+printf '0\n' >"$psroot/ACAD/online"
+printf 'Mains\n' >"$psroot/usb-gadget/type"
+printf '1\n' >"$psroot/usb-gadget/online"
+printf 'Battery\n' >"$psroot/BAT0/type"
+printf '1\n' >"$psroot/BAT0/online"
+got=$(read_ac_online "$psroot") && rc=0 || rc=$?
+assert_eq "USB Mains online does not override offline ACAD" "0" "$got"
+[ "$rc" -eq 0 ] || bad "ACAD offline read rc=$rc"
+printf '1\n' >"$psroot/ACAD/online"
+got=$(read_ac_online "$psroot") && rc=0 || rc=$?
+assert_eq "ACAD online is on AC" "1" "$got"
+rm -rf "$psroot/ACAD"
+got=$(read_ac_online "$psroot") && rc=0 || rc=$?
+if [ "$rc" -ne 0 ]; then
+    ok "only a USB Mains gadget fails closed"
+else
+    bad "USB-only Mains returned online=$got"
+fi
+mkdir -p "$psroot/ADP1"
+printf 'Mains\n' >"$psroot/ADP1/type"
+printf '1\n' >"$psroot/ADP1/online"
+got=$(read_ac_online "$psroot") && rc=0 || rc=$?
+assert_eq "ADP1 is an internal adapter" "1" "$got"
+rm -rf "$psroot/ADP1"
+mkdir -p "$psroot/ACAD"
+printf 'Mains\n' >"$psroot/ACAD/type"
+printf 'maybe\n' >"$psroot/ACAD/online"
+got=$(read_ac_online "$psroot") && rc=0 || rc=$?
+if [ "$rc" -ne 0 ]; then
+    ok "unreadable AC online value fails closed"
+else
+    bad "garbage AC online returned $got"
+fi
+
+# dGPU by vendor/class, not a hardcoded BDF
+if grep -v '^[[:space:]]*#' "$ROOT/gbmux-acpower" | grep -q '64:00.0'; then
+    bad "gbmux-acpower still hardcodes 64:00.0"
+else
+    ok "gbmux-acpower does not hardcode 64:00.0"
+fi
+kind=$(nvidia_function_kind '0x030000') && rc=0 || rc=$?
+assert_eq "class 0x030000 is VGA" "VGA" "$kind"
+kind=$(nvidia_function_kind '0x030200') && rc=0 || rc=$?
+assert_eq "class 0x030200 is VGA" "VGA" "$kind"
+kind=$(nvidia_function_kind '0x040300') && rc=0 || rc=$?
+assert_eq "class 0x040300 is AUD" "AUD" "$kind"
+if nvidia_function_kind '0x0c0330'; then
+    bad "USB class accepted as NVIDIA function"
+else
+    ok "USB class is not a NVIDIA function"
+fi
+if nvidia_vendor_ok '0x10de' && nvidia_vendor_ok '0x10DE'; then
+    ok "vendor 10de accepted"
+else
+    bad "vendor 10de accepted"
+fi
+if nvidia_vendor_ok '0x1002'; then
+    bad "AMD vendor accepted"
+else
+    ok "AMD vendor rejected"
+fi
+
+pci=$tmpdir/pci/devices
+drv=$tmpdir/pci/drivers
+mkdir -p "$pci/0000:64:00.0" "$pci/0000:64:00.1" "$pci/0000:66:00.0" \
+    "$drv/nvidia" "$drv/snd_hda_intel" "$drv/amdgpu"
+printf '0x10de\n' >"$pci/0000:64:00.0/vendor"
+printf '0x030000\n' >"$pci/0000:64:00.0/class"
+printf '0x10de\n' >"$pci/0000:64:00.1/vendor"
+printf '0x040300\n' >"$pci/0000:64:00.1/class"
+printf '0x1002\n' >"$pci/0000:66:00.0/vendor"
+printf '0x030000\n' >"$pci/0000:66:00.0/class"
+ln -s "../../drivers/nvidia" "$pci/0000:64:00.0/driver"
+ln -s "../../drivers/snd_hda_intel" "$pci/0000:64:00.1/driver"
+ln -s "../../drivers/amdgpu" "$pci/0000:66:00.0/driver"
+: >"$drv/nvidia/unbind"
+: >"$drv/snd_hda_intel/unbind"
+: >"$drv/amdgpu/unbind"
+resolved=$(resolve_nvidia_pci "$pci")
+assert_eq "audio function listed before display" "AUD 0000:64:00.1
+VGA 0000:64:00.0" "$resolved"
+unbind_log=$tmpdir/unbind.log
+: >"$unbind_log"
+GBMUX_UNBIND_LOG=$unbind_log unbind_nvidia_functions "$pci" "$drv"
+assert_eq "unbind order is audio then display" "AUD 0000:64:00.1
+VGA 0000:64:00.0" "$(cat "$unbind_log")"
+assert_eq "nvidia unbind payload" "0000:64:00.0" "$(cat "$drv/nvidia/unbind")"
+assert_eq "hda unbind payload" "0000:64:00.1" "$(cat "$drv/snd_hda_intel/unbind")"
+if [ -s "$drv/amdgpu/unbind" ]; then
+    bad "AMD iGPU was unbound"
+else
+    ok "AMD iGPU was not unbound"
+fi
+# powered-off dGPU: no 10de devices, still success
+off=$tmpdir/pci-off/devices
+mkdir -p "$off/0000:66:00.0"
+printf '0x1002\n' >"$off/0000:66:00.0/vendor"
+printf '0x030000\n' >"$off/0000:66:00.0/class"
+off_list=$(resolve_nvidia_pci "$off") && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$off_list" ]; then
+    ok "powered-off dGPU resolves to no functions"
+else
+    bad "powered-off resolve rc=$rc list=$off_list"
+fi
+
+# udev: internal adapter names only
+if grep -q 'KERNEL=="ACAD"' "$ROOT/99-gbmux-acpower.rules" \
+    && grep -q 'KERNEL=="ADP\*"' "$ROOT/99-gbmux-acpower.rules"; then
+    ok "udev matches ACAD and ADP*"
+else
+    bad "udev missing ACAD/ADP* match"
+fi
+if grep -E 'POWER_SUPPLY_TYPE.==."Mains"' "$ROOT/99-gbmux-acpower.rules" | grep -v 'KERNEL==' >/dev/null; then
+    bad "udev has a Mains rule without a kernel name"
+else
+    ok "every Mains udev rule names the adapter"
+fi
+
+# systemd sandbox + rate limit
+unit=$ROOT/gbmux-acpower.service
+for key in ProtectSystem=strict ProtectHome=read-only ProtectKernelTunables=yes \
+    PrivateTmp=yes NoNewPrivileges=yes RestrictAddressFamilies=AF_UNIX \
+    StartLimitIntervalSec=10 StartLimitBurst=5 TimeoutStartSec=30 \
+    'ReadWritePaths=/proc/acpi /sys/bus/pci /sys/module /run' \
+    'ConditionPathExistsGlob=/sys/bus/wmi/devices/ABBC0F75-*'; do
+    if grep -q -F "$key" "$unit"; then
+        ok "unit has $key"
+    else
+        bad "unit missing $key"
+    fi
+done
+if grep -v '^[[:space:]]*#' "$unit" | grep -q 'ProtectKernelModules=yes'; then
+    bad "unit sets ProtectKernelModules=yes"
+else
+    ok "unit does not set ProtectKernelModules=yes"
+fi
+
+# packaging: do not delete /usr/local, enable only with the WMI GUID
+if grep -q 'rm -f /usr/local/bin/gbmux' "$ROOT/debian/postinst" \
+    || grep -q 'rm -f /usr/local/bin/gbmux-setup' "$ROOT/debian/postinst"; then
+    bad "postinst still deletes /usr/local/bin/gbmux*"
+else
+    ok "postinst does not delete /usr/local/bin/gbmux*"
+fi
+if grep -q 'ABBC0F75' "$ROOT/debian/postinst" && grep -q 'ABBC0F75' "$ROOT/Makefile"; then
+    ok "postinst and Makefile gate enablement on ABBC0F75"
+else
+    bad "enablement is not gated on ABBC0F75"
+fi
+
+# postinst behavior with a fake systemctl and a fake WMI tree
+mkdir -p "$tmpdir/bin" "$tmpdir/nowmi" "$tmpdir/wmi/ABBC0F75-TEST"
+cat >"$tmpdir/bin/systemctl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$GBMUX_SYSTEMCTL_LOG"
+exit 0
+EOF
+chmod +x "$tmpdir/bin/systemctl"
+sc_log=$tmpdir/systemctl.log
+: >"$sc_log"
+post_err=$(GBMUX_WMI_DEVICES="$tmpdir/nowmi" GBMUX_SYSTEMCTL_LOG="$sc_log" \
+    PATH="$tmpdir/bin:$PATH" sh "$ROOT/debian/postinst" 2>&1) && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$post_err" | grep -q 'not enabling'; then
+    ok "postinst skips enable when WMI GUID is absent"
+else
+    bad "postinst without WMI: rc=$rc err=$post_err"
+fi
+if grep -q 'enable gbmux-acpower' "$sc_log"; then
+    bad "postinst enabled the service without the WMI GUID"
+else
+    ok "postinst did not enable the service without the WMI GUID"
+fi
+: >"$sc_log"
+post_err=$(GBMUX_WMI_DEVICES="$tmpdir/wmi" GBMUX_SYSTEMCTL_LOG="$sc_log" \
+    PATH="$tmpdir/bin:$PATH" sh "$ROOT/debian/postinst" 2>&1) && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'enable gbmux-acpower.service' "$sc_log"; then
+    ok "postinst enables the service when ABBC0F75 exists"
+else
+    bad "postinst with WMI: rc=$rc log=$(cat "$sc_log") err=$post_err"
+fi
+
+# muxq: DRM master / GRANT_PERMISSIONS behind an explicit flag
+if grep -q -- '--grant-permissions' "$ROOT/tools/muxq.c" \
+    && grep -q 'if (!grant)' "$ROOT/tools/muxq.c" \
+    && grep -q 'enableConsoleHotplugHandling = grant' "$ROOT/tools/muxq.c"; then
+    ok "muxq gates DRM master on --grant-permissions"
+else
+    bad "muxq does not gate DRM master"
+fi
+# the ioctl must not sit outside the grant block: the skip return is above it
+grant_line=$(grep -n 'if (!grant)' "$ROOT/tools/muxq.c" | head -n 1 | cut -d: -f1)
+ioctl_line=$(grep -n 'DRM_IOCTL_SET_MASTER' "$ROOT/tools/muxq.c" | head -n 1 | cut -d: -f1)
+skip_line=$(grep -n 'skipping DRM master' "$ROOT/tools/muxq.c" | head -n 1 | cut -d: -f1)
+if [ -n "$grant_line" ] && [ -n "$ioctl_line" ] && [ -n "$skip_line" ] \
+    && [ "$grant_line" -lt "$skip_line" ] && [ "$skip_line" -lt "$ioctl_line" ]; then
+    ok "SET_MASTER is after the grant-permissions skip"
+else
+    bad "SET_MASTER ordering grant=$grant_line skip=$skip_line ioctl=$ioctl_line"
+fi
+
+# optional AppArmor profile and commented sudoers (no call, no gbmux-setup)
+if [ -f "$ROOT/apparmor/usr.sbin.gbmux" ] && grep -q '/proc/acpi/call' "$ROOT/apparmor/usr.sbin.gbmux"; then
+    ok "optional AppArmor profile allows /proc/acpi/call"
+else
+    bad "AppArmor profile missing"
+fi
+sudoers=$ROOT/examples/gbmux.sudoers
+if [ -f "$sudoers" ]; then
+    ok "commented sudoers fragment shipped"
+else
+    bad "sudoers fragment missing"
+fi
+# privilege lines stay comments; call and gbmux-setup are not commands
+if grep -v '^[[:space:]]*#' "$sudoers" | grep -v '^[[:space:]]*$' >/dev/null; then
+    bad "sudoers fragment has an active rule"
+else
+    ok "sudoers fragment has no active rule"
+fi
+if grep -v '^[[:space:]]*#' "$sudoers" | grep -E 'call|gbmux-setup' >/dev/null; then
+    bad "sudoers active text mentions call or gbmux-setup"
+else
+    ok "sudoers active text excludes call and gbmux-setup"
+fi
+if grep '^#' "$sudoers" | grep -q 'gbmux-setup' && grep '^#' "$sudoers" | grep -q 'call'; then
+    ok "sudoers comments document the call and gbmux-setup exclusion"
+else
+    bad "sudoers comments do not mention the exclusion"
+fi
+
+# documented CLI and pinned driver still present
+if grep -q '615.71.09' "$ROOT/gbmux-setup" && grep -q 'cdceed22bbeb61248d1a6deabc2596673e3a6501698ee71ac8d2fdc28f3b70fe' "$ROOT/gbmux-setup"; then
+    ok "NVIDIA 615.71.09 pin unchanged"
+else
+    bad "NVIDIA pin changed"
+fi
+if grep -q 'mokutil --import' "$ROOT/README.md"; then
+    ok "README documents MOK enrollment"
+else
+    bad "README missing mokutil --import"
+fi
+
+if command -v dash >/dev/null 2>&1; then
+    dash_pci=$(dash -c '
+        GBMUX_ACPOWER_LIB=1
+        . "$1/gbmux-acpower"
+        nvidia_function_kind "0x030200"
+        printf " "
+        nvidia_function_kind "0x040300"
+        printf " "
+        if ac_supply_name_trusted usb; then printf BAD; else printf OK; fi
+    ' _ "$ROOT") && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$dash_pci" = "VGA AUD OK" ]; then
+        ok "dash resolves NVIDIA class and rejects USB adapter names"
+    else
+        bad "dash helper check rc=$rc out=$dash_pci"
+    fi
+else
+    ok "dash not installed — skip POSIX helper re-check"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

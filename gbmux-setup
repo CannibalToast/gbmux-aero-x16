@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # gbmux-setup — install the pinned NVIDIA driver for GB206M (RTX 5070 mobile).
 # Safe to re-run; refuses when nouveau is live (reboot with blacklist first).
 set -uo pipefail
@@ -11,43 +11,141 @@ DEST="/var/cache/gbmux/NVIDIA-Linux-x86_64-${VER}.run"
 
 die() { echo "gbmux-setup: $*" >&2; exit 1; }
 
+# Absolute helpers. GBMUX_CURL is a test hook and must itself be absolute;
+# production runs do not set it, so PATH cannot substitute curl.
+first_exec() {
+    local c
+    for c in "$@"; do
+        [[ -x $c ]] && { printf '%s' "$c"; return 0; }
+    done
+    printf '%s' "$1"
+}
+SHA256SUM=$(first_exec /usr/bin/sha256sum /bin/sha256sum)
+AWK=$(first_exec /usr/bin/awk /bin/awk)
+OD=$(first_exec /usr/bin/od /bin/od)
+TR=$(first_exec /usr/bin/tr /bin/tr)
+INSTALL=$(first_exec /usr/bin/install /bin/install)
+CHOWN=$(first_exec /bin/chown /usr/bin/chown)
+CHMOD=$(first_exec /bin/chmod /usr/bin/chmod)
+MKDIR=$(first_exec /bin/mkdir /usr/bin/mkdir)
+MV=$(first_exec /bin/mv /usr/bin/mv)
+RM=$(first_exec /bin/rm /usr/bin/rm)
+STAT=$(first_exec /usr/bin/stat /bin/stat)
+MODPROBE=$(first_exec /usr/sbin/modprobe /sbin/modprobe)
+LSMOD=$(first_exec /usr/bin/lsmod /sbin/lsmod /usr/sbin/lsmod)
+GREP=$(first_exec /usr/bin/grep /bin/grep)
+CURL=/usr/bin/curl
+
+curl_bin() {
+    if [[ -n ${GBMUX_CURL:-} && ${GBMUX_CURL} == /* && -x ${GBMUX_CURL} ]]; then
+        printf '%s' "$GBMUX_CURL"
+        return 0
+    fi
+    printf '%s' "$CURL"
+}
+
 verify_installer() {
     local dest=$1 expected=$2 got
     [[ -f "$dest" && ! -L "$dest" ]] || return 1
-    got=$(sha256sum "$dest" | awk '{print $1}')
+    got=$("$SHA256SUM" "$dest" | "$AWK" '{print $1}')
     [[ "$got" == "$expected" ]]
+}
+
+# Root-owned, not writable by group or other. Production cache is /var/cache/gbmux.
+cache_dir_trusted() {
+    local dir=$1 st uid rest gid mode group other
+    [[ -d $dir && ! -L $dir ]] || return 1
+    st=$("$STAT" -c '%u %g %a' "$dir" 2>/dev/null) || return 1
+    uid=${st%% *}
+    rest=${st#* }
+    gid=${rest%% *}
+    mode=${rest#* }
+    [[ $mode =~ ^[0-9]+$ ]] || return 1
+    group=$(( (10#$mode / 10) % 10 ))
+    other=$((10#$mode % 10))
+    case $group in
+        2|3|6|7) return 1 ;;
+    esac
+    case $other in
+        2|3|6|7) return 1 ;;
+    esac
+    if [[ $EUID -eq 0 || $dir == /var/cache/gbmux ]]; then
+        [[ $uid == 0 && $gid == 0 ]] || return 1
+    fi
+    return 0
+}
+
+prepare_cache_dir() {
+    local dir=$1
+    if [[ -L $dir ]]; then
+        echo "gbmux-setup: refusing symlink cache directory $dir" >&2
+        return 1
+    fi
+    if [[ $EUID -eq 0 ]]; then
+        "$INSTALL" -d -m 0755 -o root -g root "$dir" || return 1
+        "$CHOWN" root:root "$dir" || return 1
+        "$CHMOD" 0755 "$dir" || return 1
+    else
+        "$MKDIR" -p "$dir" || return 1
+    fi
+    if ! cache_dir_trusted "$dir"; then
+        echo "gbmux-setup: refusing cache directory $dir (must not be world-writable; /var/cache/gbmux must be root:root)" >&2
+        return 1
+    fi
+}
+
+# secure_boot_state <efi-sys-root>
+# Prints skip (not EFI), off, or on.
+# Returns 1 when the tree is EFI but the Secure Boot byte cannot be read.
+secure_boot_state() {
+    local root=${1:-/sys/firmware/efi}
+    local efivar="$root/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    local sb
+    if [[ ! -d $root ]]; then
+        printf 'skip'
+        return 0
+    fi
+    if [[ ! -f $efivar || ! -r $efivar ]]; then
+        return 1
+    fi
+    sb=$("$OD" -An -tu1 -j4 -N1 "$efivar" 2>/dev/null | "$TR" -d '[:space:]') || return 1
+    case $sb in
+        0) printf 'off' ;;
+        1) printf 'on' ;;
+        *) return 1 ;;
+    esac
 }
 
 # Optional args (tests only): dest, sha256, url. Production always uses the pins.
 ensure_installer() {
     local dest=${1:-$DEST} expected=${2:-$SHA256} url=${3:-$URL}
-    local part=${dest}.part old_umask
-    mkdir -p "$(dirname "$dest")" || {
-        echo "gbmux-setup: cannot create $(dirname "$dest")" >&2
-        return 1
-    }
+    local part=${dest}.part old_umask curl dir
+    dir=${dest%/*}
+    [[ $dir == "$dest" ]] && dir=.
+    prepare_cache_dir "$dir" || return 1
+    curl=$(curl_bin)
     if [[ ! -f $dest ]]; then
         echo "downloading $url"
         old_umask=$(umask)
         umask 077
-        rm -f "$part"
-        if ! curl --fail --proto '=https' --tlsv1.2 --retry 3 -o "$part" "$url"; then
-            rm -f "$part"
+        "$RM" -f "$part"
+        if ! "$curl" --fail --proto '=https' --tlsv1.2 --retry 3 -o "$part" "$url"; then
+            "$RM" -f "$part"
             umask "$old_umask"
             echo "gbmux-setup: download failed" >&2
             return 1
         fi
         if ! verify_installer "$part" "$expected"; then
-            rm -f "$part"
+            "$RM" -f "$part"
             umask "$old_umask"
             echo "gbmux-setup: SHA256 mismatch after download — deleted $part (expected $expected)" >&2
             return 1
         fi
-        mv -f "$part" "$dest"
+        "$MV" -f "$part" "$dest"
         umask "$old_umask"
     fi
     if ! verify_installer "$dest" "$expected"; then
-        rm -f "$dest"
+        "$RM" -f "$dest"
         echo "gbmux-setup: SHA256 mismatch — deleted $dest (expected $expected)" >&2
         return 1
     fi
@@ -69,12 +167,14 @@ fi
 
 [[ $EUID -eq 0 ]] || die "needs root"
 
-if [[ -f /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c ]]; then
-    sb=$(od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c | tr -d ' ')
-    [[ "$sb" == "1" ]] && die "Secure Boot is ON — unsigned nvidia modules won't load. Disable SB or enroll a MOK first."
-fi
+sb_state=$(secure_boot_state /sys/firmware/efi) || die "EFI system but Secure Boot state cannot be read — refusing to install unsigned modules"
+case $sb_state in
+    on) die "Secure Boot is ON — unsigned nvidia modules will not load. Enroll a MOK (mokutil --import) and reboot; do not disable Secure Boot as the default." ;;
+    off|skip) ;;
+    *) die "EFI system but Secure Boot state cannot be read — refusing to install unsigned modules" ;;
+esac
 
-if lsmod | grep -q '^nouveau'; then
+if "$LSMOD" 2>/dev/null | "$GREP" -q '^nouveau'; then
     echo "nouveau is loaded. Write /etc/modprobe.d/blacklist-nouveau.conf,"
     echo "run update-initramfs -u, reboot, then re-run this script."
     exit 1
@@ -89,15 +189,15 @@ fi
 
 # Re-hash immediately before any execution (cache hit or fresh download).
 if ! verify_installer "$DEST" "$SHA256"; then
-    rm -f "$DEST"
+    "$RM" -f "$DEST"
     die "SHA256 mismatch — deleted $DEST (expected $SHA256)"
 fi
-sh "$DEST" --check || die "archive corrupt — delete $DEST and retry"
+/bin/sh "$DEST" --check || die "archive corrupt — delete $DEST and retry"
 if ! verify_installer "$DEST" "$SHA256"; then
-    rm -f "$DEST"
+    "$RM" -f "$DEST"
     die "SHA256 mismatch after --check — deleted $DEST (expected $SHA256)"
 fi
-sh "$DEST" --silent --accept-license --dkms --no-x-check || die "installer failed — see /var/log/nvidia-installer.log"
+/bin/sh "$DEST" --silent --accept-license --dkms --no-x-check || die "installer failed — see /var/log/nvidia-installer.log"
 
-modprobe nvidia nvidia_modeset nvidia_uvm nvidia_drm 2>/dev/null
-nvidia-smi && echo && echo "done — PRIME offload: __NV_PRIME_RENDER_OFFLOAD=1 <cmd>"
+"$MODPROBE" nvidia nvidia_modeset nvidia_uvm nvidia_drm 2>/dev/null
+/usr/bin/nvidia-smi && echo && echo "done — PRIME offload: __NV_PRIME_RENDER_OFFLOAD=1 <cmd>"

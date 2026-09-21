@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # gbmux — Gigabyte AERO X16 display-mux / dGPU-power control for Linux.
 # Mirrors GiMATE's "GPU Mux Switch" + GpuPowerGear dGPU-off feature.
 #
@@ -17,6 +17,23 @@ AMW0='\_SB.PCI0.AMW0'
 GUID_SET=/sys/bus/wmi/devices/ABBC0F75-8EA1-11D1-00A0-C90629100000-2
 LOCK=${GBMUX_LOCK:-/run/gbmux.lock}
 
+# Absolute helpers. A sudo that preserves PATH must not be able to substitute these.
+first_exec() {
+    local c
+    for c in "$@"; do
+        [[ -x $c ]] && { printf '%s' "$c"; return 0; }
+    done
+    printf '%s' "$1"
+}
+FLOCK=$(first_exec /usr/bin/flock /bin/flock)
+TR=$(first_exec /usr/bin/tr /bin/tr)
+LSPCI=$(first_exec /usr/bin/lspci /sbin/lspci)
+MODPROBE=$(first_exec /usr/sbin/modprobe /sbin/modprobe)
+SED=$(first_exec /usr/bin/sed /bin/sed)
+SEQ=$(first_exec /usr/bin/seq /bin/seq)
+SLEEP=$(first_exec /bin/sleep /usr/bin/sleep)
+GREP=$(first_exec /usr/bin/grep /bin/grep)
+
 die() { echo "gbmux: $*" >&2; exit 1; }
 
 # Allowlisted ACPI: AMW0 WMBC/WMBD, method 0xE6 (mux) or 0x51 (dGPU power).
@@ -28,11 +45,11 @@ acpi_expr_allowed() {
 acall() {
     local out
     exec 9>"$LOCK" || die "cannot open ACPI lock $LOCK"
-    flock 9 || die "cannot acquire ACPI lock $LOCK"
+    "$FLOCK" 9 || die "cannot acquire ACPI lock $LOCK"
     # printf: echo would swallow payloads that look like flags.
     printf '%s\n' "$1" >"$CALL" 2>/dev/null || die "write failed: $1"
-    out=$(tr -d '\0' <"$CALL")
-    flock -u 9
+    out=$("$TR" -d '\0' <"$CALL")
+    "$FLOCK" -u 9
     case "$out" in *Error*|*rror:*) die "ACPI call failed: $1 -> $out";; esac
     printf '%s' "$out"
 }
@@ -45,14 +62,14 @@ get_mode() {
     printf '%d' "0x${BASH_REMATCH[1]}"
 }
 
-dgpu_present() { lspci -d 10de: 2>/dev/null | grep -q .; }
-dgpu_bound()   { lspci -d 10de: -k 2>/dev/null | grep -q 'Kernel driver in use: nvidia'; }
+dgpu_present() { "$LSPCI" -d 10de: 2>/dev/null | "$GREP" -q .; }
+dgpu_bound()   { "$LSPCI" -d 10de: -k 2>/dev/null | "$GREP" -q 'Kernel driver in use: nvidia'; }
 
 rescan_pci() {
-    for _ in $(seq 1 40); do
+    for _ in $("$SEQ" 1 40); do
         dgpu_present && return 0
-        echo 1 > /sys/bus/pci/rescan 2>/dev/null
-        sleep 0.25
+        printf '%s\n' 1 > /sys/bus/pci/rescan 2>/dev/null
+        "$SLEEP" 0.25
     done
     return 1
 }
@@ -64,7 +81,7 @@ fi
 [[ $EUID -eq 0 ]] || die "needs root — run via sudo"
 [[ -d /sys/bus/wmi/devices ]] && compgen -G '/sys/bus/wmi/devices/ABBC0F75-*' >/dev/null \
     || die "Gigabyte WMI interface (ABBC0F75) not present — unsupported machine"
-[[ -e $CALL ]] || modprobe acpi_call 2>/dev/null
+[[ -e $CALL ]] || "$MODPROBE" acpi_call 2>/dev/null
 [[ -e $CALL ]] || die "acpi_call not available (install acpi-call-dkms)"
 
 case "${1:-}" in
@@ -72,7 +89,7 @@ case "${1:-}" in
     m=$(get_mode)
     echo "mux mode   : $(mode_name "$m") (0x$(printf %x "$m"))"
     if dgpu_present; then
-      echo "dGPU       : on PCI bus"; lspci -d 10de: -nn | sed 's/^/             /'
+      echo "dGPU       : on PCI bus"; "$LSPCI" -d 10de: -nn | "$SED" 's/^/             /'
       dgpu_bound && echo "             driver: nvidia bound" || echo "             driver: not nvidia/unbound"
     else
       echo "dGPU       : powered off (D3cold)"
@@ -93,7 +110,7 @@ case "${1:-}" in
       on)
         acall "$AMW0.WMBD 0 0x51 { 0x04 }" >/dev/null
         if rescan_pci; then
-          echo "dGPU powered on:"; lspci -d 10de: -nn | sed 's/^/  /'
+          echo "dGPU powered on:"; "$LSPCI" -d 10de: -nn | "$SED" 's/^/  /'
         else
           echo "no NVIDIA device after power-on — check dmesg" >&2; exit 1
         fi

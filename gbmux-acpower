@@ -9,16 +9,45 @@
 # - Never runs in Discrete mux mode — the dGPU owns the panel there.
 # - Never ejects while compute clients hold /dev/nvidia* fds — the driver
 #   remove path waits on them and wedges. RTD3 covers that case instead.
-# - Audio function (.1) must be unbound BEFORE the GPU (.0): snd_card_free
-#   hangs on a powered-down/dead codec if the order is flipped.
+# - The NVIDIA audio function must be unbound BEFORE the display function:
+#   snd_card_free hangs on a powered-down/dead codec if the order is flipped.
+# - PCI addresses are resolved from sysfs (vendor 10de, display vs HD-audio
+#   class). They are not a baked-in BDF — 64:00.0 is typical on this board
+#   but not assumed.
+# - Only the internal AC adapter (ACAD or ADP*) may flip policy. Any other
+#   Mains supply, including a USB gadget, is ignored.
 
-VGA=0000:64:00.0
-AUD=0000:64:00.1
 GBMUX=${GBMUX:-/usr/sbin/gbmux}
 CONF=${GBMUX_ACPOWER_CONF:-/etc/gbmux-acpower.conf}
 POLICY_LOCK=${GBMUX_ACPOWER_LOCK:-/run/gbmux-acpower.lock}
+PCI_DEVICES=${GBMUX_PCI_DEVICES:-/sys/bus/pci/devices}
+PCI_DRIVERS=${GBMUX_PCI_DRIVERS:-/sys/bus/pci/drivers}
+POWER_SUPPLY=${GBMUX_POWER_SUPPLY:-/sys/class/power_supply}
 
-log() { logger -t gbmux-acpower "$1"; }
+# Absolute helpers. Never search PATH (a manual root shell can be tainted).
+first_exec() {
+    for c in "$@"; do
+        if [ -x "$c" ]; then
+            printf '%s' "$c"
+            return 0
+        fi
+    done
+    printf '%s' "$1"
+}
+LOGGER=$(first_exec /usr/bin/logger /bin/logger)
+MODPROBE=$(first_exec /usr/sbin/modprobe /sbin/modprobe)
+FUSER=$(first_exec /usr/bin/fuser /bin/fuser)
+PS=$(first_exec /usr/bin/ps /bin/ps)
+KILL=$(first_exec /bin/kill /usr/bin/kill)
+SLEEP=$(first_exec /bin/sleep /usr/bin/sleep)
+STAT=$(first_exec /usr/bin/stat /bin/stat)
+CAT=$(first_exec /bin/cat /usr/bin/cat)
+TR=$(first_exec /usr/bin/tr /bin/tr)
+FLOCK=$(first_exec /usr/bin/flock /bin/flock)
+READLINK=$(first_exec /usr/bin/readlink /bin/readlink)
+SORT=$(first_exec /usr/bin/sort /bin/sort)
+
+log() { "$LOGGER" -t gbmux-acpower "$1"; }
 
 mux_mode_ok() {
     case "$1" in
@@ -28,7 +57,7 @@ mux_mode_ok() {
 }
 
 fuser_available() {
-    command -v fuser >/dev/null 2>&1
+    [ -x "$FUSER" ]
 }
 
 pid_is_numeric() {
@@ -42,7 +71,7 @@ pid_is_numeric() {
 conf_is_trusted() {
     path=$1
     [ -f "$path" ] && [ ! -L "$path" ] || return 1
-    st=$(stat -c '%u %g %a' "$path" 2>/dev/null) || return 1
+    st=$("$STAT" -c '%u %g %a' "$path" 2>/dev/null) || return 1
     uid=${st%% *}
     rest=${st#* }
     gid=${rest%% *}
@@ -146,6 +175,118 @@ load_kill_on_battery() {
     return 0
 }
 
+# Internal adapter names only. USB HID UPS / docks / gadgets often register
+# type=Mains under some other sysfs name and must not force dGPU on or off.
+ac_supply_name_trusted() {
+    case $1 in
+        ACAD|ADP*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# read_ac_online <power_supply-dir>
+# Prints 0 or 1. Returns non-zero when no trusted internal adapter is present
+# (fail closed: do not treat "no readable ACAD" as battery and eject).
+read_ac_online() {
+    root=$1
+    found=0
+    online=0
+    for p in "$root"/*; do
+        [ -f "$p/type" ] || continue
+        name=${p##*/}
+        ac_supply_name_trusted "$name" || continue
+        type=$("$CAT" "$p/type" 2>/dev/null) || continue
+        type=$(printf '%s' "$type" | "$TR" -d ' \t\r\n')
+        [ "$type" = Mains ] || continue
+        found=1
+        on=$("$CAT" "$p/online" 2>/dev/null) || return 1
+        on=$(printf '%s' "$on" | "$TR" -d ' \t\r\n')
+        case $on in
+            1) online=1 ;;
+            0) ;;
+            *) return 1 ;;
+        esac
+    done
+    [ "$found" = 1 ] || return 1
+    printf '%s' "$online"
+}
+
+# sysfs class code -> VGA (display 0x03xxxx) or AUD (HD-audio 0x0403xx).
+nvidia_function_kind() {
+    class=$(printf '%s' "$1" | "$TR" -d ' \t\r\n' | "$TR" 'A-F' 'a-f')
+    case $class in
+        0x03????) printf 'VGA' ;;
+        0x0403??) printf 'AUD' ;;
+        *) return 1 ;;
+    esac
+}
+
+nvidia_vendor_ok() {
+    v=$(printf '%s' "$1" | "$TR" -d ' \t\r\n' | "$TR" 'A-F' 'a-f')
+    [ "$v" = "0x10de" ]
+}
+
+# resolve_nvidia_pci <devices-dir>
+# Prints "AUD <bdf>" lines, then "VGA <bdf>" lines (audio first).
+# No NVIDIA device (dGPU already in D3cold) is success with empty output.
+# Non-NVIDIA functions, including a device sitting at a familiar BDF, are ignored.
+resolve_nvidia_pci() {
+    dir=$1
+    auds=""
+    vgas=""
+    [ -d "$dir" ] || return 0
+    for dev in "$dir"/*; do
+        [ -f "$dev/vendor" ] && [ -f "$dev/class" ] || continue
+        vendor=$("$CAT" "$dev/vendor" 2>/dev/null) || continue
+        nvidia_vendor_ok "$vendor" || continue
+        class=$("$CAT" "$dev/class" 2>/dev/null) || continue
+        kind=$(nvidia_function_kind "$class") || continue
+        bdf=${dev##*/}
+        case $bdf in
+            [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F].[0-7]) ;;
+            *) continue ;;
+        esac
+        if [ "$kind" = AUD ]; then
+            auds="$auds $bdf"
+        else
+            vgas="$vgas $bdf"
+        fi
+    done
+    for b in $auds; do
+        printf 'AUD %s\n' "$b"
+    done
+    for b in $vgas; do
+        printf 'VGA %s\n' "$b"
+    done
+}
+
+# Unbind NVIDIA audio functions, then display functions. No-op if none are bound.
+unbind_nvidia_functions() {
+    pci_devices=${1:-$PCI_DEVICES}
+    pci_drivers=${2:-$PCI_DRIVERS}
+    list=$(resolve_nvidia_pci "$pci_devices") || return 1
+    [ -n "$list" ] || return 0
+    printf '%s\n' "$list" | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        kind=${line%% *}
+        bdf=${line#* }
+        dev="$pci_devices/$bdf"
+        [ -d "$dev/driver" ] || continue
+        link=$("$READLINK" "$dev/driver" 2>/dev/null) || continue
+        drv=${link##*/}
+        [ -n "$drv" ] || continue
+        case $drv in
+            *[!A-Za-z0-9._-]*) continue ;;
+        esac
+        if [ -n "${GBMUX_UNBIND_LOG:-}" ]; then
+            printf '%s %s\n' "$kind" "$bdf" >> "$GBMUX_UNBIND_LOG"
+        fi
+        if [ -e "$pci_drivers/$drv/unbind" ]; then
+            printf '%s\n' "$bdf" > "$pci_drivers/$drv/unbind" 2>/dev/null || true
+        fi
+    done
+}
+
 if [ "${GBMUX_ACPOWER_LIB:-}" = 1 ]; then
     return 0 2>/dev/null || true
 fi
@@ -153,17 +294,16 @@ fi
 # Serialize overlapping udev oneshots (unbind vs gpu on). Separate from
 # /run/gbmux.lock so calling gbmux (which flocks ACPI) cannot deadlock.
 exec 8>"$POLICY_LOCK" || { log "cannot open $POLICY_LOCK"; exit 1; }
-flock 8 || { log "cannot acquire $POLICY_LOCK"; exit 1; }
+"$FLOCK" 8 || { log "cannot acquire $POLICY_LOCK"; exit 1; }
 
-# AC state: online if any Mains-type supply reports online
-online=0
-for p in /sys/class/power_supply/*; do
-    [ "$(cat "$p/type" 2>/dev/null)" = Mains ] || continue
-    [ "$(cat "$p/online" 2>/dev/null)" = 1 ] && online=1
-done
+# AC state: only the internal adapter. Missing adapter is not "on battery".
+if ! online=$(read_ac_online "$POWER_SUPPLY"); then
+    log "internal AC state unavailable (want ACAD/ADP* online 0 or 1) — AC policy skipped"
+    exit 0
+fi
 
 mode=$("$GBMUX" mode 2>/dev/null) || { log "gbmux mode read failed"; exit 0; }
-mode=$(printf '%s' "$mode" | tr -d ' \t\r\n')
+mode=$(printf '%s' "$mode" | "$TR" -d ' \t\r\n')
 if [ "$mode" = 1 ]; then
     log "Discrete mux mode — AC policy skipped"
     exit 0
@@ -175,7 +315,7 @@ fi
 
 if [ "$online" = 1 ]; then
     if "$GBMUX" gpu on >/dev/null 2>&1; then
-        modprobe nvidia nvidia_modeset nvidia_drm 2>/dev/null
+        "$MODPROBE" nvidia nvidia_modeset nvidia_drm 2>/dev/null
         log "on AC: dGPU powered on"
     else
         log "on AC: dGPU power-on failed"
@@ -199,36 +339,33 @@ fi
 
 # Compute/control fds (CUDA, NVENC, nvidia-smi loops) pin the driver's
 # remove path; kwin's /dev/dri/card* fds do not. Eject only if none held.
-pids=$(fuser /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null)
+pids=$("$FUSER" /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null) || true
 if [ -n "$pids" ] && [ -n "$KILL_ON_BATTERY" ]; then
     for p in $pids; do
         pid_is_numeric "$p" || continue
-        kill -0 "$p" 2>/dev/null || continue
-        comm=$(ps -o comm= -p "$p" 2>/dev/null)
-        comm=$(printf '%s' "$comm" | tr -d ' \t')
+        "$KILL" -0 "$p" 2>/dev/null || continue
+        comm=$("$PS" -o comm= -p "$p" 2>/dev/null) || true
+        comm=$(printf '%s' "$comm" | "$TR" -d ' \t')
         [ -n "$comm" ] || continue
         for name in $KILL_ON_BATTERY; do
             if [ "$comm" = "$name" ]; then
-                kill "$p" 2>/dev/null && log "killed $comm ($p) holding dGPU"
+                "$KILL" "$p" 2>/dev/null && log "killed $comm ($p) holding dGPU"
                 break
             fi
         done
     done
-    sleep 2
-    pids=$(fuser /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null)
+    "$SLEEP" 2
+    pids=$("$FUSER" /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null) || true
 fi
 if [ -n "$pids" ]; then
-    log "on battery: GPU held by $(ps -o comm= -p $pids 2>/dev/null | sort -u | tr '\n' ' ')— not ejecting (RTD3 may still suspend it)"
+    log "on battery: GPU held by $("$PS" -o comm= -p $pids 2>/dev/null | "$SORT" -u | "$TR" '\n' ' ')— not ejecting (RTD3 may still suspend it)"
     exit 0
 fi
 
 # Audio first, while the chip is still powered: snd_card_free needs it alive.
-[ -d /sys/bus/pci/devices/$AUD/driver ] &&
-    echo "$AUD" > "/sys/bus/pci/drivers/snd_hda_intel/unbind" 2>/dev/null
-# Then the GPU function.
-[ -d /sys/bus/pci/devices/$VGA/driver ] &&
-    echo "$VGA" > /sys/bus/pci/drivers/nvidia/unbind 2>/dev/null
-modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null
+# Display function second. Both are discovered by vendor/class, not a fixed BDF.
+unbind_nvidia_functions "$PCI_DEVICES" "$PCI_DRIVERS"
+"$MODPROBE" -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null
 
 if "$GBMUX" gpu off >/dev/null 2>&1; then
     log "on battery: dGPU ejected"
