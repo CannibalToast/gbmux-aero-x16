@@ -1,0 +1,3 @@
+/etc/gbmux-acpower.conf
+/etc/modprobe.d/gbmux-nouveau.conf
+/etc/udev/rules.d/99-gbmux-acpower.rules

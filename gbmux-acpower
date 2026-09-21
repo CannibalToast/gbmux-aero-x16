@@ -14,8 +14,146 @@
 
 VGA=0000:64:00.0
 AUD=0000:64:00.1
+GBMUX=${GBMUX:-/usr/sbin/gbmux}
+CONF=${GBMUX_ACPOWER_CONF:-/etc/gbmux-acpower.conf}
+POLICY_LOCK=${GBMUX_ACPOWER_LOCK:-/run/gbmux-acpower.lock}
 
 log() { logger -t gbmux-acpower "$1"; }
+
+mux_mode_ok() {
+    case "$1" in
+        0|1|2) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+fuser_available() {
+    command -v fuser >/dev/null 2>&1
+}
+
+pid_is_numeric() {
+    case $1 in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# uid 0, gid 0, mode 0644 or stricter (no group/other write, no execute).
+conf_is_trusted() {
+    path=$1
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    st=$(stat -c '%u %g %a' "$path" 2>/dev/null) || return 1
+    uid=${st%% *}
+    rest=${st#* }
+    gid=${rest%% *}
+    mode=${rest#* }
+    [ "$uid" = 0 ] && [ "$gid" = 0 ] || return 1
+    # 0644 or stricter: no group/other write, no execute (stat %a is unpadded).
+    case $mode in
+        644|640|600|444|440|400|000) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_valid_comm() {
+    case $1 in
+        ''|*[!A-Za-z0-9._-]* ) return 1 ;;
+    esac
+    [ "${#1}" -ge 1 ] && [ "${#1}" -le 15 ]
+}
+
+# Parse KILL_ON_BATTERY=value only. Never source/eval the file.
+parse_kill_on_battery() {
+    conf=$1
+    val=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%"$(printf '\r')"}
+        trimmed=${line#"${line%%[![:space:]]*}"}
+        [ -n "$trimmed" ] || continue
+        case "$trimmed" in
+            \#*) continue ;;
+        esac
+        trimmed=${trimmed%"${trimmed##*[![:space:]]}"}
+        case "$trimmed" in
+            KILL_ON_BATTERY=*)
+                raw=${trimmed#KILL_ON_BATTERY=}
+                parsed=$(_parse_assignment_value "$raw") || return 1
+                val=$parsed
+                ;;
+            *)
+                # ignore comments already handled; ignore unknown keys (not executed)
+                ;;
+        esac
+    done < "$conf"
+    # validate tokens
+    for tok in $val; do
+        _valid_comm "$tok" || return 1
+    done
+    printf '%s' "$val"
+}
+
+_parse_assignment_value() {
+    raw=$1
+    case "$raw" in
+        \"\")
+            printf ''
+            return 0
+            ;;
+        \'\')
+            printf ''
+            return 0
+            ;;
+        \"*\")
+            inner=${raw#\"}
+            inner=${inner%\"}
+            case "$inner" in
+                *\"*|*"'"*|*[\\\$\`\;\|\&\(\)\<\>]*) return 1 ;;
+            esac
+            printf '%s' "$inner"
+            return 0
+            ;;
+        \'*\')
+            inner=${raw#\'}
+            inner=${inner%\'}
+            case "$inner" in
+                *\"*|*"'"*|*[\\\$\`\;\|\&\(\)\<\>]*) return 1 ;;
+            esac
+            printf '%s' "$inner"
+            return 0
+            ;;
+        *)
+            case "$raw" in
+                *[[:space:]]*|*[\\\$\`\;\|\&\(\)\<\>\"\']*) return 1 ;;
+            esac
+            printf '%s' "$raw"
+            return 0
+            ;;
+    esac
+}
+
+load_kill_on_battery() {
+    KILL_ON_BATTERY=""
+    [ -f "$CONF" ] || return 0
+    if ! conf_is_trusted "$CONF"; then
+        log "refusing untrusted $CONF (want root:root, 0644 or stricter)"
+        return 1
+    fi
+    parsed=$(parse_kill_on_battery "$CONF") || {
+        log "invalid $CONF"
+        return 1
+    }
+    KILL_ON_BATTERY=$parsed
+    return 0
+}
+
+if [ "${GBMUX_ACPOWER_LIB:-}" = 1 ]; then
+    return 0 2>/dev/null || true
+fi
+
+# Serialize overlapping udev oneshots (unbind vs gpu on). Separate from
+# /run/gbmux.lock so calling gbmux (which flocks ACPI) cannot deadlock.
+exec 8>"$POLICY_LOCK" || { log "cannot open $POLICY_LOCK"; exit 1; }
+flock 8 || { log "cannot acquire $POLICY_LOCK"; exit 1; }
 
 # AC state: online if any Mains-type supply reports online
 online=0
@@ -24,14 +162,19 @@ for p in /sys/class/power_supply/*; do
     [ "$(cat "$p/online" 2>/dev/null)" = 1 ] && online=1
 done
 
-mode=$(/usr/sbin/gbmux mode 2>/dev/null) || { log "gbmux mode read failed"; exit 0; }
+mode=$("$GBMUX" mode 2>/dev/null) || { log "gbmux mode read failed"; exit 0; }
+mode=$(printf '%s' "$mode" | tr -d ' \t\r\n')
 if [ "$mode" = 1 ]; then
     log "Discrete mux mode — AC policy skipped"
     exit 0
 fi
+if ! mux_mode_ok "$mode"; then
+    log "unrecognized mux mode '$mode' — AC policy skipped"
+    exit 0
+fi
 
 if [ "$online" = 1 ]; then
-    if /usr/sbin/gbmux gpu on >/dev/null 2>&1; then
+    if "$GBMUX" gpu on >/dev/null 2>&1; then
         modprobe nvidia nvidia_modeset nvidia_drm 2>/dev/null
         log "on AC: dGPU powered on"
     else
@@ -45,18 +188,31 @@ fi
 # Optional: /etc/gbmux-acpower.conf -> KILL_ON_BATTERY="rustdesk obs"
 # Named processes holding the GPU get killed so they can restart and fall
 # back to iGPU/software paths. Opt-in: killing apps loses their GPU work.
-KILL_ON_BATTERY=""
-[ -f /etc/gbmux-acpower.conf ] && . /etc/gbmux-acpower.conf
+if ! load_kill_on_battery; then
+    exit 1
+fi
+
+if ! fuser_available; then
+    log "fuser not found (install psmisc) — not ejecting"
+    exit 0
+fi
 
 # Compute/control fds (CUDA, NVENC, nvidia-smi loops) pin the driver's
 # remove path; kwin's /dev/dri/card* fds do not. Eject only if none held.
 pids=$(fuser /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null)
 if [ -n "$pids" ] && [ -n "$KILL_ON_BATTERY" ]; then
     for p in $pids; do
+        pid_is_numeric "$p" || continue
+        kill -0 "$p" 2>/dev/null || continue
         comm=$(ps -o comm= -p "$p" 2>/dev/null)
-        case " $KILL_ON_BATTERY " in
-            *" $comm "*) kill "$p" 2>/dev/null && log "killed $comm ($p) holding dGPU";;
-        esac
+        comm=$(printf '%s' "$comm" | tr -d ' \t')
+        [ -n "$comm" ] || continue
+        for name in $KILL_ON_BATTERY; do
+            if [ "$comm" = "$name" ]; then
+                kill "$p" 2>/dev/null && log "killed $comm ($p) holding dGPU"
+                break
+            fi
+        done
     done
     sleep 2
     pids=$(fuser /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null)
@@ -74,7 +230,7 @@ fi
     echo "$VGA" > /sys/bus/pci/drivers/nvidia/unbind 2>/dev/null
 modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null
 
-if /usr/sbin/gbmux gpu off >/dev/null 2>&1; then
+if "$GBMUX" gpu off >/dev/null 2>&1; then
     log "on battery: dGPU ejected"
 else
     log "on battery: eject failed — see journal"

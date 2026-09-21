@@ -15,18 +15,24 @@ set -uo pipefail
 CALL=/proc/acpi/call
 AMW0='\_SB.PCI0.AMW0'
 GUID_SET=/sys/bus/wmi/devices/ABBC0F75-8EA1-11D1-00A0-C90629100000-2
+LOCK=${GBMUX_LOCK:-/run/gbmux.lock}
 
 die() { echo "gbmux: $*" >&2; exit 1; }
 
-[[ $EUID -eq 0 ]] || die "needs root — run via sudo"
-[[ -d /sys/bus/wmi/devices ]] && compgen -G '/sys/bus/wmi/devices/ABBC0F75-*' >/dev/null \
-    || die "Gigabyte WMI interface (ABBC0F75) not present — unsupported machine"
-[[ -e $CALL ]] || modprobe acpi_call 2>/dev/null
-[[ -e $CALL ]] || die "acpi_call not available (install acpi-call-dkms)"
+# Allowlisted ACPI: AMW0 WMBC/WMBD, method 0xE6 (mux) or 0x51 (dGPU power).
+acpi_expr_allowed() {
+    local re='^\\_SB\.PCI0\.AMW0\.WMB[CD] 0 0x([Ee]6|51) \{[ 0-9xXa-fA-F]+\}$'
+    [[ "$1" =~ $re ]]
+}
 
 acall() {
-    echo "$1" > $CALL 2>/dev/null || die "write failed: $1"
-    local out; out=$(tr -d '\0' < $CALL)
+    local out
+    exec 9>"$LOCK" || die "cannot open ACPI lock $LOCK"
+    flock 9 || die "cannot acquire ACPI lock $LOCK"
+    # printf: echo would swallow payloads that look like flags.
+    printf '%s\n' "$1" >"$CALL" 2>/dev/null || die "write failed: $1"
+    out=$(tr -d '\0' <"$CALL")
+    flock -u 9
     case "$out" in *Error*|*rror:*) die "ACPI call failed: $1 -> $out";; esac
     printf '%s' "$out"
 }
@@ -50,6 +56,16 @@ rescan_pci() {
     done
     return 1
 }
+
+if [[ "${GBMUX_LIB:-}" == 1 ]]; then
+    return 0 2>/dev/null || true
+fi
+
+[[ $EUID -eq 0 ]] || die "needs root — run via sudo"
+[[ -d /sys/bus/wmi/devices ]] && compgen -G '/sys/bus/wmi/devices/ABBC0F75-*' >/dev/null \
+    || die "Gigabyte WMI interface (ABBC0F75) not present — unsupported machine"
+[[ -e $CALL ]] || modprobe acpi_call 2>/dev/null
+[[ -e $CALL ]] || die "acpi_call not available (install acpi-call-dkms)"
 
 case "${1:-}" in
   status)
@@ -92,6 +108,7 @@ case "${1:-}" in
     ;;
   call)  # escape hatch: gbmux call '\_SB.PCI0.AMW0.WMBC 0 0xE6 {0}'
     [[ -n "${2:-}" ]] || die "usage: gbmux call '<acpi expression>'"
+    acpi_expr_allowed "$2" || die "ACPI expression not allowed (WMBC/WMBD 0xE6|0x51 only)"
     acall "$2"; echo
     ;;
   *) cat <<'EOF'
@@ -103,7 +120,7 @@ gbmux — Gigabyte AERO X16 mux/dGPU control
   gbmux hybrid            MS-hybrid mode                          [reboot]
   gbmux gpu on            power dGPU onto the PCI bus (runtime)
   gbmux gpu off           power dGPU off (runtime; refuses if nvidia bound)
-  gbmux call '<expr>'     raw acpi_call (debug)
+  gbmux call '<expr>'     acpi_call allowlisted to AMW0 WMBC/WMBD 0xE6|0x51
 EOF
     ;;
 esac
