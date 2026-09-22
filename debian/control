@@ -4,6 +4,7 @@ Architecture: all
 Maintainer: cannibaltoast
 Depends: acpi-call-dkms, pciutils, kmod, curl, psmisc, procps
 Recommends: dmidecode
+Suggests: apparmor
 Description: Gigabyte AERO X16 display-mux and dGPU power control
  Linux implementation of GiMATE's GPU Mux Switch + GpuPowerGear dGPU-off.
  Talks to the Gigabyte EC through the GB_WMIACPI WMI/ACPI interface

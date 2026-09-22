@@ -1,13 +1,33 @@
 #!/bin/sh
 set -e
+# Test hook only. dpkg does not set this; production uses the kernel sysfs tree.
+WMI_DEVICES=${GBMUX_WMI_DEVICES:-/sys/bus/wmi/devices}
+
+wmi_guid_present() {
+    [ -d "$WMI_DEVICES" ] || return 1
+    for g in "$WMI_DEVICES"/ABBC0F75-*; do
+        [ -e "$g" ] && return 0
+    done
+    return 1
+}
+
 # Load acpi_call if the dkms module is already built for the running kernel.
 modprobe acpi_call 2>/dev/null || true
-# Remove a stale manual install to avoid two copies on PATH.
-rm -f /usr/local/bin/gbmux /usr/local/bin/gbmux-setup
-# Pick up the udev rule and enable the AC/battery power policy.
+# Do not delete /usr/local/bin/gbmux*. Those names may belong to something else.
+# Packaged copies are /usr/sbin/gbmux and /usr/sbin/gbmux-setup.
+for stale in /usr/local/bin/gbmux /usr/local/bin/gbmux-setup; do
+    if [ -e "$stale" ] || [ -L "$stale" ]; then
+        echo "gbmux: leaving $stale in place; packaged copy is /usr/sbin/$(basename "$stale")" >&2
+    fi
+done
+# Pick up the udev rule. Enable AC policy only on a Gigabyte WMI machine.
 udevadm control --reload 2>/dev/null || true
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload 2>/dev/null || true
-    systemctl enable gbmux-acpower.service 2>/dev/null || true
+    if wmi_guid_present; then
+        systemctl enable gbmux-acpower.service 2>/dev/null || true
+    else
+        echo "gbmux: Gigabyte WMI GUID ABBC0F75 not present — not enabling gbmux-acpower.service" >&2
+    fi
 fi
 exit 0

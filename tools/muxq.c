@@ -46,8 +46,24 @@ static void dump_dpylist(const char *name, NVDpyIdList list)
     printf("\n");
 }
 
+static int grant_requested(int argc, char **argv)
+{
+    int i;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--grant-permissions") == 0)
+            return 1;
+        fprintf(stderr, "usage: muxq [--grant-permissions]\n");
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    int grant = grant_requested(argc, argv);
+    if (grant < 0)
+        return 2;
+
     int kms = open("/dev/nvidia-modeset", O_RDWR | O_CLOEXEC);
     if (kms < 0) {
         perror("open /dev/nvidia-modeset");
@@ -62,7 +78,9 @@ int main(int argc, char **argv)
         snprintf(ap.request.versionString,
                  sizeof(ap.request.versionString), "%s", NV_VERSION_STRING);
         ap.request.deviceId.rmDeviceId = id;
-        ap.request.enableConsoleHotplugHandling = TRUE;
+        /* Hotplug handling is only useful to a client that will take DRM
+         * master. The default probe leaves it off. */
+        ap.request.enableConsoleHotplugHandling = grant ? TRUE : FALSE;
         if (kms_ioctl(kms, NVKMS_IOCTL_ALLOC_DEVICE, &ap, sizeof(ap)) == 0 &&
             ap.reply.status == NVKMS_ALLOC_DEVICE_STATUS_SUCCESS)
             dev_ok = id;
@@ -124,8 +142,14 @@ int main(int argc, char **argv)
                    nvDpyIdToNvU32(dpy), errno);
     }
 
-    /* 4. Try the sub-owner permission path via DRM master on the nvidia card.
-     * Find the DRM card bound to the nvidia driver. */
+    /* 4. DRM master + GRANT_PERMISSIONS is opt-in. It can steal the
+     * compositor's master fd and widen SUB_OWNER on this kms fd. */
+    if (!grant) {
+        printf("skipping DRM master / GRANT_PERMISSIONS "
+               "(pass --grant-permissions to enable)\n");
+        return 0;
+    }
+
     for (int c = 0; c < 8; c++) {
         char path[64], drv[128];
         snprintf(path, sizeof(path), "/dev/dri/card%d", c);

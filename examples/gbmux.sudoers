@@ -1,0 +1,17 @@
+# gbmux — commented sudoers fragment.
+# Copy to /etc/sudoers.d/gbmux only after review (`visudo -cf` on the copy).
+# Every privilege line below is commented out. This file grants nothing as shipped.
+#
+# `call` and `gbmux-setup` are intentionally absent:
+#   - `gbmux call` is an ACPI/EC escape hatch
+#   - `gbmux-setup` downloads and runs the NVIDIA installer as root
+# Do not add either command to a NOPASSWD rule.
+#
+# discrete and `gpu off` can blank the panel. Leave them commented unless
+# you accept that.
+#
+# Cmnd_Alias GBMUX_STATUS = /usr/sbin/gbmux status, /usr/sbin/gbmux mode
+# Cmnd_Alias GBMUX_MUX = /usr/sbin/gbmux dynamic, /usr/sbin/gbmux discrete, /usr/sbin/gbmux hybrid
+# Cmnd_Alias GBMUX_GPU = /usr/sbin/gbmux gpu on, /usr/sbin/gbmux gpu off
+# %gbmux ALL=(root) NOPASSWD: GBMUX_STATUS
+# %gbmux ALL=(root) NOPASSWD: GBMUX_MUX, GBMUX_GPU

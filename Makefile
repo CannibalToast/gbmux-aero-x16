@@ -11,10 +11,16 @@ install:
 	install -Dm644 gbmux-nouveau.conf $(DESTDIR)/etc/modprobe.d/gbmux-nouveau.conf
 	install -Dm644 gbmux-acpower.conf $(DESTDIR)/etc/gbmux-acpower.conf
 	install -Dm644 README.md $(DESTDIR)$(PREFIX)/share/doc/gbmux/README.md
+	install -Dm644 apparmor/usr.sbin.gbmux $(DESTDIR)$(PREFIX)/share/doc/gbmux/apparmor/usr.sbin.gbmux
+	install -Dm644 examples/gbmux.sudoers $(DESTDIR)$(PREFIX)/share/doc/gbmux/examples/gbmux.sudoers
 ifndef DESTDIR
 	udevadm control --reload || true
 	systemctl daemon-reload || true
-	systemctl enable gbmux-acpower.service || true
+	if [ -d /sys/bus/wmi/devices ] && ls -d /sys/bus/wmi/devices/ABBC0F75-* >/dev/null 2>&1; then \
+		systemctl enable gbmux-acpower.service || true; \
+	else \
+		echo "gbmux: Gigabyte WMI GUID ABBC0F75 not present — not enabling gbmux-acpower.service"; \
+	fi
 endif
 
 uninstall:

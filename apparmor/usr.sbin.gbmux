@@ -1,0 +1,37 @@
+#include <tunables/global>
+
+# Optional profile for /usr/sbin/gbmux. The package does not load it.
+# Review on the target, then:
+#   sudo apparmor_parser -r /usr/share/doc/gbmux/apparmor/usr.sbin.gbmux
+# Prefer complain mode first (`apparmor_parser -C`) on a real AERO X16.
+# gbmux is a shell script; if the profile does not attach via the shebang
+# path, run it with: aa-exec -p gbmux -- /usr/sbin/gbmux status
+
+profile gbmux /usr/sbin/gbmux {
+  #include <abstractions/base>
+
+  /usr/sbin/gbmux r,
+  /bin/bash ix,
+  /usr/bin/bash ix,
+  /usr/bin/flock ix,
+  /usr/bin/tr ix,
+  /usr/bin/lspci ix,
+  /usr/bin/sed ix,
+  /usr/bin/seq ix,
+  /bin/sleep ix,
+  /usr/sbin/modprobe ix,
+  /sbin/modprobe ix,
+
+  /proc/acpi/call rw,
+  /sys/bus/wmi/devices/ r,
+  /sys/bus/wmi/devices/ABBC0F75-*/ r,
+  /sys/bus/wmi/devices/ABBC0F75-*/** r,
+  /sys/bus/pci/ r,
+  /sys/bus/pci/** r,
+  /sys/bus/pci/rescan w,
+  /sys/module/acpi_call/ r,
+  /sys/module/acpi_call/** r,
+  /run/gbmux.lock rwk,
+
+  deny network,
+}

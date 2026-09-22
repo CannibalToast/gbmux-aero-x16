@@ -1,10 +1,34 @@
 [Unit]
 Description=gbmux AC/battery dGPU power policy (AERO X16)
-# Runs at boot and on every AC online/offline udev event; idempotent.
+# Boot, and udev events for the internal AC adapter. Idempotent.
+# Start limits count successful starts so a flaky jack or a noisy
+# power_supply device cannot stack unbind/modprobe runs.
+StartLimitIntervalSec=10
+StartLimitBurst=5
+ConditionPathExistsGlob=/sys/bus/wmi/devices/ABBC0F75-*
 
 [Service]
 Type=oneshot
+TimeoutStartSec=30
 ExecStart=/usr/lib/gbmux/gbmux-acpower
+# Sandbox stops where module load/unload needs access. Do not set
+# ProtectKernelModules=yes — modprobe and modprobe -r would fail.
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ReadWritePaths=/proc/acpi /sys/bus/pci /sys/module /run
+PrivateTmp=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictRealtime=yes
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
